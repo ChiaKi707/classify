@@ -1,0 +1,7 @@
+# 推荐Python 3.12；固定为本机核验过的直接依赖版本。
+# 已有torch 2.6.0+cu124也满足torch==2.6.0。
+numpy==2.3.4
+pandas==2.3.3
+scikit-learn==1.7.2
+matplotlib==3.10.6
+torch==2.6.0
