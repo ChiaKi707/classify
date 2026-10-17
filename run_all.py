@@ -13,10 +13,13 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 import pandas as pd
 
-from config import ChineseParser, MODELS, ROOT, setup_console
+from config import (
+    CHECKPOINT_FORMAT_VERSION, ChineseParser, MODELS, ROOT, TASK_NAME, setup_console,
+)
 from data import data_fingerprints, parse_data_spec, resolve_data_specs
 from metrics import plt
 from train import add_training_arguments, validate_arguments
+from training_control import TRAINING_POLICY_VERSION
 
 TRAIN_SCRIPT = ROOT / "train.py"
 MODEL_NAMES_CN = {item["channel_set"]: item["name"] for item in MODELS.values()}
@@ -30,9 +33,15 @@ SUMMARY_COLUMNS_CN = {
     "trainable_parameters": "可训练参数",
     "best_epoch": "最佳训练轮次",
     "best_validation_loss": "最佳验证损失",
-    "test_bce_loss": "测试BCE损失",
+    "training_policy_version": "训练策略版本",
+    "epochs_completed": "实际完成轮数",
+    "stopped_early": "是否触发早停",
+    "early_stopping_reference_epoch": "早停参考轮次",
+    "early_stopping_reference_loss": "早停参考损失",
+    "epochs_without_significant_improvement": "连续无有效改善轮数",
+    "test_cross_entropy_loss": "测试交叉熵损失",
     "exact_match_accuracy": "完全正确率",
-    "macro_f1_four_class": "四类别平均F1",
+    "macro_f1_three_class": "三类别平均F1",
     "macro_f1_observed_class": "实际类别平均F1",
     "macro_f1_analyte": "成分平均F1",
     "hamming_loss": "标签错误率",
@@ -40,13 +49,10 @@ SUMMARY_COLUMNS_CN = {
     "MG1_recall": "MG1召回率",
     "MG1_f1": "MG1的F1",
     "MG1_roc_auc": "MG1的AUC",
-    "MG1_threshold": "MG1阈值",
     "R6G_precision": "R6G精确率",
     "R6G_recall": "R6G召回率",
     "R6G_f1": "R6G的F1",
     "R6G_roc_auc": "R6G的AUC",
-    "R6G_threshold": "R6G阈值",
-    "blank_samples_available": "包含空白样本",
     "group": "分组",
     "n_samples": "样本数",
     "MG1_positive_support": "MG1阳性数",
@@ -71,6 +77,8 @@ def verify_identical_splits(output_dirs: Sequence[Path]) -> None:
     columns = [
         "source_file",
         "row_in_file",
+        "parent_source_row",
+        "augmentation_index",
         "role",
         "concentration_group",
         "split",
@@ -95,6 +103,8 @@ def collect_results(configs: Sequence[Dict[str, Any]], output_root: Path) -> pd.
         output_dir = output_root / config["folder"]
         with (output_dir / "test_metrics.json").open("r", encoding="utf-8") as handle:
             metrics = json.load(handle)
+        if metrics.get("training_policy_version") != TRAINING_POLICY_VERSION:
+            raise ValueError(f"{output_dir.name}使用旧训练策略，请重新训练后再汇总")
         summary_rows.append(
             {
                 "order": config["order"],
@@ -104,11 +114,16 @@ def collect_results(configs: Sequence[Dict[str, Any]], output_root: Path) -> pd.
                 "trainable_parameters": metrics["trainable_parameters"],
                 "best_epoch": metrics["best_epoch"],
                 "best_validation_loss": metrics["best_validation_loss"],
-                "test_bce_loss": metrics["test_bce_loss"],
+                **{key: metrics[key] for key in (
+                    "training_policy_version", "epochs_completed", "stopped_early",
+                    "early_stopping_reference_epoch", "early_stopping_reference_loss",
+                    "epochs_without_significant_improvement",
+                )},
+                "test_cross_entropy_loss": metrics["test_cross_entropy_loss"],
                 "exact_match_accuracy": metrics["exact_match_accuracy"],
-                "macro_f1_four_class": metrics["macro_f1_four_class"],
+                "macro_f1_three_class": metrics["macro_f1_three_class"],
                 "macro_f1_observed_class": metrics.get(
-                    "macro_f1_observed_class", metrics["macro_f1_four_class"]
+                    "macro_f1_observed_class", metrics["macro_f1_three_class"]
                 ),
                 "macro_f1_analyte": metrics["macro_f1_analyte"],
                 "hamming_loss": metrics["hamming_loss"],
@@ -116,13 +131,10 @@ def collect_results(configs: Sequence[Dict[str, Any]], output_root: Path) -> pd.
                 "MG1_recall": metrics["per_analyte"]["MG1"]["recall"],
                 "MG1_f1": metrics["per_analyte"]["MG1"]["f1"],
                 "MG1_roc_auc": metrics["per_analyte"]["MG1"]["roc_auc"],
-                "MG1_threshold": metrics["per_analyte"]["MG1"]["threshold"],
                 "R6G_precision": metrics["per_analyte"]["R6G"]["precision"],
                 "R6G_recall": metrics["per_analyte"]["R6G"]["recall"],
                 "R6G_f1": metrics["per_analyte"]["R6G"]["f1"],
                 "R6G_roc_auc": metrics["per_analyte"]["R6G"]["roc_auc"],
-                "R6G_threshold": metrics["per_analyte"]["R6G"]["threshold"],
-                "blank_samples_available": metrics["blank_samples_available"],
             }
         )
         concentration = pd.read_csv(output_dir / "tables" / "test_metrics_by_concentration.csv")
@@ -161,7 +173,7 @@ def plot_summary(summary: pd.DataFrame, path: Path) -> None:
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.bar(x - width, summary["exact_match_accuracy"], width, label="完全正确率")
     ax.bar(x, summary["macro_f1_analyte"], width, label="成分平均F1")
-    ax.bar(x + width, summary["macro_f1_observed_class"], width, label="实际类别平均F1")
+    ax.bar(x + width, summary["macro_f1_three_class"], width, label="三类别平均F1")
     ax.set_xticks(x, names, rotation=12)
     ax.set_ylim(0, 1.03)
     ax.set_ylabel("测试集分数")
@@ -211,9 +223,17 @@ def can_skip(args: argparse.Namespace, number: int, fingerprints: List[Dict[str,
     try:
         with (directory / "training_config.json").open(encoding="utf-8") as handle:
             saved = json.load(handle)
+        with (directory / "test_metrics.json").open(encoding="utf-8") as handle:
+            metrics = json.load(handle)
     except (OSError, ValueError):
         return False
     if saved.get("data_files") != fingerprints:
+        return False
+    if (saved.get("format_version") != CHECKPOINT_FORMAT_VERSION
+            or saved.get("task") != TASK_NAME):
+        return False
+    if any(record.get("training_policy_version") != TRAINING_POLICY_VERSION
+           for record in (saved, metrics)):
         return False
     old_args = saved.get("training_args", {})
     if old_args.get("model") != number:
@@ -264,8 +284,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     plot_summary(summary, figure_dir / "ablation_summary.png")
     print("\n四个模型已完成，训练/验证/测试拆分完全一致。")
     print(to_chinese_table(summary[[
-        "order", "model", "best_validation_loss", "test_bce_loss",
-        "exact_match_accuracy", "macro_f1_observed_class",
+        "order", "model", "best_validation_loss", "test_cross_entropy_loss",
+        "exact_match_accuracy", "macro_f1_three_class",
     ]]).to_string(index=False))
     print(f"中文对比表：{output_root / 'compare' / 'tables' / '四模型对比结果.csv'}")
     return 0
@@ -278,4 +298,3 @@ if __name__ == "__main__":
             subprocess.CalledProcessError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
         raise SystemExit(2)
-

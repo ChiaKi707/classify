@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
-"""模型包的公开入口：from models import DualPresenceMSNet。"""
+"""模型包的公开入口：from models import ReagentClassMSNet。"""
 
-from .net import DualPresenceMSNet
+from .net import ReagentClassMSNet
 
-__all__ = ["DualPresenceMSNet"]
-
+__all__ = ["ReagentClassMSNet"]

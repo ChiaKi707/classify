@@ -13,9 +13,19 @@ import torch
 
 # 默认目录以当前工程为基准，复制整个工程后无需更改路径。
 ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / "data"
+RAW_DATA_DIR = ROOT / "data"
+DATA_DIR = ROOT / "data_augmented"
 PT_DIR = ROOT / "pt"
 OUTPUT_DIR = ROOT / "output"
+
+# 版本2开始把业务任务定义为三个互斥类别：仅MG1、仅R6G、两者都有。
+# 版本3改为可追溯的离线扩充；训练期间不再动态改变光谱。
+# 版本4采用“平移→强度变化→高斯模糊”的多轮概率增强链及简化编号。
+# 版本5把第三项修正为加性高斯噪声，其他离线扩充规则保持不变。
+# 版本6保留来源绑定拆分，但各集合内所有版本均逐行参与训练或评价。
+# 待测样品保证至少含一种目标试剂，因此不建模“二者都无”。
+CHECKPOINT_FORMAT_VERSION = 6
+TASK_NAME = "three_class_reagent_presence"
 
 # 四个版本共用同一网络；区别仅是输入通道数与对应的光谱预处理。
 MODELS = {
@@ -31,10 +41,15 @@ DEFAULT_DATA = (
     ("both", "R6g1_MG2.csv"),
 )
 
-# 模型内部始终按 [MG1, R6G] 的顺序保存两个标签。
 ANALYTE_NAMES = ("MG1", "R6G")
-# 二进制标签转成最终四种中文结果时使用此顺序。
-CLASS_NAMES = ("无", "有MG1", "有R6G", "两者都有")
+# 三个类别的顺序同时决定训练标签、Softmax输出和混淆矩阵顺序。
+CLASS_NAMES = ("仅MG1", "仅R6G", "两者都有")
+# 每个三分类结果对应的成分存在状态，用于派生成分召回率和误报率。
+CLASS_ANALYTE_TARGETS = (
+    (1, 0),
+    (0, 1),
+    (1, 1),
+)
 # 四个消融实验是“累积增加”通道，便于逐步判断每个通道的贡献。
 CHANNEL_SETS = {
     "raw": ("standardized_raw",),
@@ -55,6 +70,9 @@ CHANNEL_NAMES_CN = {
 }
 TABLE_COLUMNS_CN = {
     "sample_id": "样本编号",
+    "parent_source_row": "原始光谱行序号",
+    "augmentation_index": "扩充编号",
+    "is_augmented": "是否扩充光谱",
     "concentration_text": "浓度文本",
     "row_in_file": "样本行序号",
     "csv_line": "CSV文件行号",
@@ -68,7 +86,7 @@ TABLE_COLUMNS_CN = {
     "group": "分组",
     "n_samples": "样本数",
     "exact_match_accuracy": "完全正确率",
-    "macro_f1_four_class": "四类别平均F1",
+    "macro_f1_three_class": "三类别平均F1",
     "macro_f1_observed_class": "实际类别平均F1",
     "macro_f1_analyte": "成分平均F1",
     "hamming_loss": "标签错误率",
@@ -87,19 +105,20 @@ TABLE_COLUMNS_CN = {
     "train_loss": "训练损失",
     "val_loss": "验证损失",
     "val_exact_accuracy": "验证集完全正确率",
+    "val_macro_f1_three_class": "验证集三类别平均F1",
     "val_macro_f1_analyte": "验证集成分平均F1",
+    "checkpoint_updated": "是否更新最低损失权重",
+    "early_stopping_improved": "是否达到早停有效改善",
+    "best_validation_loss": "历史最低验证损失",
+    "early_stopping_reference_loss": "早停参考验证损失",
+    "epochs_without_significant_improvement": "连续无有效改善轮数",
 }
-ROLE_TARGETS = {
-    "none": (0, 0),
-    "mg": (1, 0),
-    "r6g": (0, 1),
-    "both": (1, 1),
+ROLE_CLASS_IDS = {
+    "mg": 0,
+    "r6g": 1,
+    "both": 2,
 }
 ROLE_ALIASES = {
-    "none": "none",
-    "blank": "none",
-    "water": "none",
-    "control": "none",
     "mg": "mg",
     "mg1": "mg",
     "r6g": "r6g",

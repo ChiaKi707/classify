@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""批量推理、阈值选择、指标计算、结果表格与中文绘图。"""
+"""三分类批量推理、指标计算、结果表格与中文绘图。"""
 
 from __future__ import annotations
 
@@ -21,45 +21,29 @@ from sklearn.metrics import (
 )
 from torch.utils.data import DataLoader
 
-from config import ANALYTE_NAMES, CLASS_NAMES
+from config import ANALYTE_NAMES, CLASS_ANALYTE_TARGETS, CLASS_NAMES
 
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Arial Unicode MS", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
 
 
-def targets_to_class_id(binary_targets: np.ndarray) -> np.ndarray:
-    target = np.asarray(binary_targets, dtype=np.int64)
-    return target[:, 0] + 2 * target[:, 1]
+CLASS_TO_ANALYTES = np.asarray(CLASS_ANALYTE_TARGETS, dtype=np.int64)
 
 
-def probabilities_to_binary(
-    probabilities: np.ndarray, thresholds: Sequence[float]
-) -> np.ndarray:
-    return (probabilities >= np.asarray(thresholds)[None, :]).astype(np.int64)
+def class_ids_to_analytes(class_ids: np.ndarray) -> np.ndarray:
+    """把三个互斥类别转换成[MG1存在, R6G存在]，仅用于派生指标。"""
+    ids = np.asarray(class_ids, dtype=np.int64).reshape(-1)
+    if np.any(ids < 0) or np.any(ids >= len(CLASS_NAMES)):
+        raise ValueError("类别编号超出三分类范围")
+    return CLASS_TO_ANALYTES[ids]
 
 
-def calibrate_thresholds(y_true: np.ndarray, probabilities: np.ndarray) -> List[float]:
-    thresholds: List[float] = []
-    candidates = np.linspace(0.05, 0.95, 181)
-    # MG1 和 R6G 分别在验证集上寻找 F1 最高的阈值。
-    # 测试集不会参与阈值选择，避免测试结果泄漏。
-    for column in range(2):
-        if len(np.unique(y_true[:, column])) < 2:
-            thresholds.append(0.5)
-            continue
-        scores = [
-            f1_score(
-                y_true[:, column],
-                (probabilities[:, column] >= candidate).astype(int),
-                zero_division=0,
-            )
-            for candidate in candidates
-        ]
-        best = np.flatnonzero(np.isclose(scores, np.max(scores)))
-        # 相同 F1 时选最接近 0.5 的阈值，避免极端阈值。
-        best_index = best[np.argmin(np.abs(candidates[best] - 0.5))]
-        thresholds.append(float(candidates[best_index]))
-    return thresholds
+def class_probabilities_to_analyte_probabilities(probabilities: np.ndarray) -> np.ndarray:
+    """由三类概率求每种成分的边缘存在概率。"""
+    probs = np.asarray(probabilities, dtype=np.float64)
+    if probs.ndim != 2 or probs.shape[1] != len(CLASS_NAMES):
+        raise ValueError(f"类别概率必须是[N,{len(CLASS_NAMES)}]形状")
+    return probs @ CLASS_TO_ANALYTES
 
 
 @torch.no_grad()
@@ -70,7 +54,7 @@ def predict_loader(
     probabilities: List[np.ndarray] = []
     targets: List[np.ndarray] = []
     losses: List[float] = []
-    criterion = nn.BCEWithLogitsLoss(reduction="mean")
+    criterion = nn.CrossEntropyLoss(reduction="mean")
     for batch in loader:
         if isinstance(batch, (tuple, list)):
             x_batch, y_batch = batch
@@ -78,7 +62,7 @@ def predict_loader(
         else:
             x_batch, y_batch = batch, None
         logits = model(x_batch.to(device, non_blocking=True))
-        probabilities.append(torch.sigmoid(logits).cpu().numpy())
+        probabilities.append(torch.softmax(logits, dim=1).cpu().numpy())
         if y_batch is not None:
             targets.append(y_batch.cpu().numpy())
             losses.append(float(criterion(logits, y_batch).item()) * len(x_batch))
@@ -89,13 +73,12 @@ def predict_loader(
     return probs, true, sum(losses) / len(true)
 
 
-def compute_metrics(
-    y_true: np.ndarray, probabilities: np.ndarray, thresholds: Sequence[float]
-) -> Dict[str, Any]:
-    binary_true = np.asarray(y_true, dtype=np.int64)
-    binary_pred = probabilities_to_binary(probabilities, thresholds)
-    true_class = targets_to_class_id(binary_true)
-    pred_class = targets_to_class_id(binary_pred)
+def compute_metrics(y_true: np.ndarray, probabilities: np.ndarray) -> Dict[str, Any]:
+    true_class = np.asarray(y_true, dtype=np.int64).reshape(-1)
+    pred_class = np.asarray(probabilities).argmax(axis=1).astype(np.int64)
+    binary_true = class_ids_to_analytes(true_class)
+    binary_pred = class_ids_to_analytes(pred_class)
+    analyte_probabilities = class_probabilities_to_analyte_probabilities(probabilities)
 
     precision, recall, f1, support = precision_recall_fscore_support(
         binary_true, binary_pred, average=None, zero_division=0
@@ -104,31 +87,31 @@ def compute_metrics(
     for column, name in enumerate(ANALYTE_NAMES):
         auc = None
         if len(np.unique(binary_true[:, column])) == 2:
-            auc = float(roc_auc_score(binary_true[:, column], probabilities[:, column]))
+            auc = float(roc_auc_score(binary_true[:, column], analyte_probabilities[:, column]))
         per_analyte[name] = {
             "precision": float(precision[column]),
             "recall": float(recall[column]),
             "f1": float(f1[column]),
             "support_positive": int(support[column]),
             "roc_auc": auc,
-            "threshold": float(thresholds[column]),
         }
 
-    cm = confusion_matrix(true_class, pred_class, labels=[0, 1, 2, 3])
+    labels = list(range(len(CLASS_NAMES)))
+    cm = confusion_matrix(true_class, pred_class, labels=labels)
     report = classification_report(
         true_class,
         pred_class,
-        labels=[0, 1, 2, 3],
+        labels=labels,
         target_names=CLASS_NAMES,
         output_dict=True,
         zero_division=0,
     )
     return {
         "exact_match_accuracy": float(accuracy_score(true_class, pred_class)),
-        "macro_f1_four_class": float(
-            f1_score(true_class, pred_class, labels=[0, 1, 2, 3], average="macro", zero_division=0)
+        "macro_f1_three_class": float(
+            f1_score(true_class, pred_class, labels=labels, average="macro", zero_division=0)
         ),
-        # 没有空白数据时只评价真实出现的 3 类，避免固定四类 F1 上限只有 0.75。
+        # 分浓度、分类别时可能只有部分真实类别，因此同时保存组内实际类别平均F1。
         "macro_f1_observed_class": float(
             f1_score(
                 true_class,
@@ -147,14 +130,20 @@ def compute_metrics(
     }
 
 
-def plot_history(history: List[Dict[str, float]], path: Path) -> None:
+def plot_history(
+    history: List[Dict[str, Any]], path: Path, best_epoch: Optional[int] = None
+) -> None:
     frame = pd.DataFrame(history)
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
     axes[0].plot(frame["epoch"], frame["train_loss"], label="训练集")
     axes[0].plot(frame["epoch"], frame["val_loss"], label="验证集")
-    axes[0].set(xlabel="训练轮次", ylabel="二元交叉熵损失", title="训练与验证损失")
+    if best_epoch is not None:
+        axes[0].axvline(best_epoch, color="gray", linestyle="--",
+                       label=f"保留权重：第{best_epoch}轮")
+    axes[0].set(xlabel="训练轮次", ylabel="交叉熵损失", title="训练与验证损失")
     axes[0].legend()
     axes[1].plot(frame["epoch"], frame["val_exact_accuracy"], label="完全正确率")
+    axes[1].plot(frame["epoch"], frame["val_macro_f1_three_class"], label="三类别平均F1")
     axes[1].plot(frame["epoch"], frame["val_macro_f1_analyte"], label="成分平均F1")
     axes[1].set(xlabel="训练轮次", ylabel="分数", ylim=(0, 1.02), title="验证集指标")
     axes[1].legend()
@@ -169,16 +158,16 @@ def plot_confusion(matrix: Sequence[Sequence[int]], path: Path) -> None:
     image = ax.imshow(cm, cmap="Blues")
     fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
     ax.set(
-        xticks=np.arange(4),
-        yticks=np.arange(4),
+        xticks=np.arange(len(CLASS_NAMES)),
+        yticks=np.arange(len(CLASS_NAMES)),
         xticklabels=CLASS_NAMES,
         yticklabels=CLASS_NAMES,
         xlabel="预测类别",
         ylabel="真实类别",
         title="测试集混淆矩阵",
     )
-    for row in range(4):
-        for column in range(4):
+    for row in range(len(CLASS_NAMES)):
+        for column in range(len(CLASS_NAMES)):
             color = "white" if cm[row, column] > cm.max() / 2 else "black"
             ax.text(column, row, str(cm[row, column]), ha="center", va="center", color=color)
     fig.tight_layout()
@@ -189,19 +178,22 @@ def plot_confusion(matrix: Sequence[Sequence[int]], path: Path) -> None:
 def make_prediction_frame(
     metadata: pd.DataFrame,
     probabilities: np.ndarray,
-    thresholds: Sequence[float],
     y_true: Optional[np.ndarray] = None,
 ) -> pd.DataFrame:
-    binary = probabilities_to_binary(probabilities, thresholds)
-    class_ids = targets_to_class_id(binary)
+    class_ids = np.asarray(probabilities).argmax(axis=1).astype(np.int64)
+    binary = class_ids_to_analytes(class_ids)
+    analyte_probabilities = class_probabilities_to_analyte_probabilities(probabilities)
     frame = metadata.reset_index(drop=True).copy()
-    frame["MG1概率"] = probabilities[:, 0]
-    frame["R6G概率"] = probabilities[:, 1]
+    frame["仅MG1类别概率"] = probabilities[:, 0]
+    frame["仅R6G类别概率"] = probabilities[:, 1]
+    frame["两者都有类别概率"] = probabilities[:, 2]
+    frame["MG1存在概率"] = analyte_probabilities[:, 0]
+    frame["R6G存在概率"] = analyte_probabilities[:, 1]
     frame["预测含MG1"] = binary[:, 0]
     frame["预测含R6G"] = binary[:, 1]
     frame["预测类别"] = [CLASS_NAMES[value] for value in class_ids]
     if y_true is not None:
-        true_ids = targets_to_class_id(y_true)
+        true_ids = np.asarray(y_true, dtype=np.int64).reshape(-1)
         frame["真实类别"] = [CLASS_NAMES[value] for value in true_ids]
         frame["是否正确"] = class_ids == true_ids
     return frame
@@ -211,22 +203,23 @@ def metrics_by_group(
     metadata: pd.DataFrame,
     y_true: np.ndarray,
     probabilities: np.ndarray,
-    thresholds: Sequence[float],
     group_column: str,
 ) -> pd.DataFrame:
     """生成消融研究所需的浓度/角色分组指标。"""
     meta = metadata.reset_index(drop=True)
-    binary_true = np.asarray(y_true, dtype=np.int64)
-    binary_pred = probabilities_to_binary(probabilities, thresholds)
+    class_true = np.asarray(y_true, dtype=np.int64).reshape(-1)
+    class_pred = np.asarray(probabilities).argmax(axis=1).astype(np.int64)
+    binary_true = class_ids_to_analytes(class_true)
+    binary_pred = class_ids_to_analytes(class_pred)
     rows: List[Dict[str, Any]] = []
     for group_value, indices in meta.groupby(group_column, sort=False, dropna=False).indices.items():
         idx = np.asarray(indices, dtype=np.int64)
-        group_metrics = compute_metrics(binary_true[idx], probabilities[idx], thresholds)
+        group_metrics = compute_metrics(class_true[idx], probabilities[idx])
         row: Dict[str, Any] = {
             "group": str(group_value),
             "n_samples": int(len(idx)),
             "exact_match_accuracy": group_metrics["exact_match_accuracy"],
-            "macro_f1_four_class": group_metrics["macro_f1_four_class"],
+            "macro_f1_three_class": group_metrics["macro_f1_three_class"],
             "macro_f1_observed_class": group_metrics["macro_f1_observed_class"],
             "macro_f1_analyte": group_metrics["macro_f1_analyte"],
             "hamming_loss": group_metrics["hamming_loss"],
@@ -261,4 +254,3 @@ def json_default(value: Any):
     if isinstance(value, Path):
         return str(value)
     raise TypeError(f"无法 JSON 序列化：{type(value)}")
-

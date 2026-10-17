@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""数据读取、分组拆分、缺失点处理、光谱通道与训练增强。"""
+"""扩充CSV读取、来源分组拆分、缺失点处理与光谱通道预处理。"""
 
 from __future__ import annotations
 
@@ -15,23 +15,21 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from config import ANALYTE_NAMES, CHANNEL_SETS, DATA_DIR, DEFAULT_DATA, ROLE_ALIASES, ROLE_TARGETS
+from config import CHANNEL_SETS, DATA_DIR, DEFAULT_DATA, ROLE_ALIASES, ROLE_CLASS_IDS
 
 
 def resolve_data_specs(specs: Optional[Sequence[str]]) -> List[str]:
-    """省略--data时读取四个默认文件；存在blank.csv时同时加入空白数据。"""
+    """省略--data时读取data_augmented中的四个离线扩充文件。"""
     if specs:
         return list(specs)
     missing = [name for _, name in DEFAULT_DATA if not (DATA_DIR / name).is_file()]
     if missing:
         raise FileNotFoundError(
-            f"请先把数据放入 {DATA_DIR}，缺少：{'、'.join(missing)}。"
+            f"默认训练数据目录 {DATA_DIR} 缺少：{'、'.join(missing)}。"
+            "请先运行 python augment_dataset.py 生成离线扩充CSV；"
             "也可以用 --data mg=路径 等参数指定文件，详见README.md。"
         )
-    result = [f"{role}={DATA_DIR / name}" for role, name in DEFAULT_DATA]
-    if (DATA_DIR / "blank.csv").is_file():
-        result.append(f"none={DATA_DIR / 'blank.csv'}")
-    return result
+    return [f"{role}={DATA_DIR / name}" for role, name in DEFAULT_DATA]
 
 
 def data_fingerprints(specs: Sequence[Tuple[str, Path]]) -> List[Dict[str, str]]:
@@ -55,7 +53,7 @@ def parse_data_spec(spec: str) -> Tuple[str, Path]:
     role_key = re.sub(r"[\s_:\-]", "", raw_role.lower())
     role = ROLE_ALIASES.get(role_key)
     if role is None:
-        valid = "none/blank、mg/mg1、r6g、both/mix/mix11/mix12"
+        valid = "mg/mg1、r6g、both/mix/mix11/mix12"
         raise argparse.ArgumentTypeError(f"未知角色 {raw_role!r}；可用：{valid}")
     # 统一绝对路径，避免同一文件用相对/绝对写法时产生不同的拆分清单。
     path = Path(raw_path).expanduser().resolve()
@@ -143,14 +141,35 @@ def read_spectral_csv(
             axis = target_axis.copy()
             interpolated = True
 
+    sample_ids = raw.iloc[1:, 0].astype(str).to_numpy()
+    # 离线扩充编号示例：00023_0为原始版本，00023_1～N为增强版本。
+    encoded = pd.Series(sample_ids).str.extract(r"^(\d{5,})_(\d+)$")
+    encoded_rows = encoded.notna().all(axis=1).to_numpy()
+    if encoded_rows.any() and not encoded_rows.all():
+        raise ValueError(f"{path} 的扩充样本编号格式不一致")
+    if encoded_rows.all():
+        parent_source_row = encoded.iloc[:, 0].astype(np.int64).to_numpy()
+        augmentation_index = encoded.iloc[:, 1].astype(np.int64).to_numpy()
+        lineage = pd.DataFrame(
+            {"parent": parent_source_row, "augmentation": augmentation_index}
+        )
+        if lineage.duplicated().any():
+            raise ValueError(f"{path} 存在重复的原始光谱/扩充编号")
+    else:
+        parent_source_row = np.arange(1, len(raw), dtype=np.int64)
+        augmentation_index = np.zeros(len(parent_source_row), dtype=np.int64)
+
     metadata = pd.DataFrame(
         {
-            "sample_id": raw.iloc[1:, 0].astype(str).to_numpy(),
+            "sample_id": sample_ids,
             "concentration_text": raw.iloc[1:, 1].astype(str).to_numpy(),
             "row_in_file": np.arange(1, len(raw), dtype=np.int64),
             # CSV第一行是波数标题，因此实际文件行号从2开始。
             "csv_line": np.arange(2, len(raw) + 1, dtype=np.int64),
             "repaired_points": repaired_points,
+            "parent_source_row": parent_source_row,
+            "augmentation_index": augmentation_index,
+            "is_augmented": augmentation_index > 0,
         }
     )
     metadata["concentration_group"] = metadata["concentration_text"].map(
@@ -181,8 +200,7 @@ def load_training_data(
         x, axis, meta, interpolated = read_spectral_csv(path, reference_axis)
         if reference_axis is None:
             reference_axis = axis.copy()
-        target = np.asarray(ROLE_TARGETS[role], dtype=np.float32)
-        y = np.repeat(target[None, :], len(x), axis=0)
+        y = np.full(len(x), ROLE_CLASS_IDS[role], dtype=np.int64)
         meta["role"] = role
         meta["source_file"] = str(path)
         meta["source_id"] = f"source_{source_number:02d}_{role}_{path.stem}"
@@ -193,23 +211,17 @@ def load_training_data(
 
     assert reference_axis is not None
     x_all = np.concatenate(all_x, axis=0).astype(np.float32)
-    y_all = np.concatenate(all_y, axis=0).astype(np.float32)
+    y_all = np.concatenate(all_y, axis=0).astype(np.int64)
     meta_all = pd.concat(all_meta, ignore_index=True)
     return x_all, y_all, reference_axis, meta_all
 
 
 def validate_targets(y: np.ndarray, roles: Sequence[str]) -> None:
-    for column, name in enumerate(ANALYTE_NAMES):
-        values = set(y[:, column].astype(int).tolist())
-        if values != {0, 1}:
-            raise ValueError(
-                f"{name} 标签需要同时包含阳性和阴性，当前为 {sorted(values)}。"
-            )
-    if "none" not in roles:
-        warnings.warn(
-            "没有空白/无目标样本：模型可学习两个试剂各自的阴性，但“无”类别"
-            "从未被训练和评估。部署前应补充同基底空白谱。",
-            stacklevel=2,
+    values = set(np.asarray(y, dtype=np.int64).tolist())
+    if values != set(ROLE_CLASS_IDS.values()):
+        raise ValueError(
+            "三分类训练必须同时包含mg、r6g、both三类，"
+            f"当前角色为{sorted(set(roles))}、类别编号为{sorted(values)}。"
         )
 
 
@@ -220,7 +232,7 @@ def grouped_stratified_split(
     group_size: int,
     seed: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
-    """在每个文件/浓度内按连续采集块拆分，减少相邻复测谱跨集合的情况。"""
+    """按原始光谱来源绑定拆分，拆分后每个版本均作为一行独立样本。"""
     if val_fraction <= 0 or test_fraction <= 0 or val_fraction + test_fraction >= 1:
         raise ValueError("val_fraction、test_fraction 必须 > 0，且两者之和 < 1")
     if group_size < 1:
@@ -228,6 +240,8 @@ def grouped_stratified_split(
 
     # 固定随机种子后，四个通道模型会得到完全相同的数据拆分。
     rng = np.random.default_rng(seed)
+    # assignments记录每行所属原始光谱应进入哪个集合。扩充版本必须跟随原始谱，
+    # 防止同一条原始光谱的近似版本跨集合造成数据泄漏。
     assignments = np.full(len(metadata), -1, dtype=np.int8)  # 0 train, 1 val, 2 test
     notes: List[str] = []
 
@@ -236,7 +250,13 @@ def grouped_stratified_split(
     ).indices
     for (source_id, conc), raw_indices in strata.items():
         indices = np.sort(np.asarray(raw_indices, dtype=np.int64))
-        blocks = np.arange(len(indices), dtype=np.int64) // group_size
+        parent_rows = metadata.iloc[indices]["parent_source_row"].to_numpy(dtype=np.int64)
+        unique_parents = np.unique(parent_rows)
+        parent_rank = {int(parent): rank for rank, parent in enumerate(unique_parents)}
+        blocks = np.asarray(
+            [parent_rank[int(parent)] // group_size for parent in parent_rows],
+            dtype=np.int64,
+        )
         unique_blocks = np.unique(blocks)
 
         if len(unique_blocks) >= 3:
@@ -254,26 +274,39 @@ def grouped_stratified_split(
             val_blocks = set(shuffled[n_test : n_test + n_val].tolist())
             for idx, block in zip(indices, blocks):
                 assignments[idx] = 2 if block in test_blocks else 1 if block in val_blocks else 0
-        elif len(indices) >= 3:
+        elif len(unique_parents) >= 3:
             notes.append(
-                f"{source_id}/{conc} 只有 {len(unique_blocks)} 个采集块，退化为逐行拆分"
+                f"{source_id}/{conc} 只有 {len(unique_blocks)} 个采集块，"
+                "退化为逐原始光谱拆分"
             )
-            shuffled_rows = rng.permutation(indices)
-            n_test = max(1, int(round(len(indices) * test_fraction)))
-            n_val = max(1, int(round(len(indices) * val_fraction)))
-            if n_test + n_val >= len(indices):
+            shuffled_parents = rng.permutation(unique_parents)
+            n_test = max(1, int(round(len(unique_parents) * test_fraction)))
+            n_val = max(1, int(round(len(unique_parents) * val_fraction)))
+            if n_test + n_val >= len(unique_parents):
                 n_test, n_val = 1, 1
-            assignments[shuffled_rows[:n_test]] = 2
-            assignments[shuffled_rows[n_test : n_test + n_val]] = 1
-            assignments[shuffled_rows[n_test + n_val :]] = 0
+            test_parents = set(shuffled_parents[:n_test].tolist())
+            val_parents = set(shuffled_parents[n_test : n_test + n_val].tolist())
+            for idx, parent in zip(indices, parent_rows):
+                assignments[idx] = (
+                    2 if parent in test_parents else 1 if parent in val_parents else 0
+                )
         else:
-            raise ValueError(f"{source_id}/{conc} 只有 {len(indices)} 行，无法三路拆分")
+            raise ValueError(
+                f"{source_id}/{conc} 只有 {len(unique_parents)} 条原始光谱，无法三路拆分"
+            )
 
     if np.any(assignments < 0):
         raise RuntimeError("内部错误：存在未分配的数据行")
-    result = tuple(np.flatnonzero(assignments == code) for code in (0, 1, 2))
+    result = (
+        np.flatnonzero(assignments == 0),
+        np.flatnonzero(assignments == 1),
+        np.flatnonzero(assignments == 2),
+    )
     if any(len(part) == 0 for part in result):
         raise ValueError("拆分后有空集合，请增加数据量或调整拆分比例")
+    notes.append(
+        "来源绑定仅用于集合拆分；拆分完成后，各集合内的原始行和扩充行均逐行参与计算"
+    )
     return result[0], result[1], result[2], notes
 
 
@@ -378,41 +411,15 @@ class SpectraDataset(Dataset):
         self,
         x: np.ndarray,
         y: Optional[np.ndarray] = None,
-        augment: bool = False,
-        noise_std: float = 0.01,
-        shift_points: int = 2,
     ):
         self.x = torch.from_numpy(np.asarray(x, dtype=np.float32))
-        self.y = None if y is None else torch.from_numpy(np.asarray(y, dtype=np.float32))
-        self.augment = augment
-        self.noise_std = float(noise_std)
-        self.shift_points = int(shift_points)
+        self.y = None if y is None else torch.from_numpy(np.asarray(y, dtype=np.int64))
 
     def __len__(self) -> int:
         return len(self.x)
 
-    def _augment(self, spectrum: torch.Tensor) -> torch.Tensor:
-        spectrum = spectrum.clone()
-        if self.shift_points > 0:
-            shift = int(
-                torch.randint(-self.shift_points, self.shift_points + 1, (1,)).item()
-            )
-            if shift:
-                spectrum = torch.roll(spectrum, shifts=shift, dims=-1)
-                if shift > 0:
-                    spectrum[:, :shift] = spectrum[:, shift : shift + 1]
-                else:
-                    spectrum[:, shift:] = spectrum[:, shift - 1 : shift]
-        gain = 1.0 + 0.03 * torch.randn(1)
-        spectrum = spectrum * gain
-        if self.noise_std > 0:
-            spectrum = spectrum + self.noise_std * torch.randn_like(spectrum)
-        return spectrum
-
     def __getitem__(self, index: int):
         spectrum = self.x[index]
-        if self.augment:
-            spectrum = self._augment(spectrum)
         if self.y is None:
             return spectrum
         return spectrum, self.y[index]
