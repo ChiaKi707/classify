@@ -1,6 +1,6 @@
-# 本地实验数据：原始数据、准备数据和临时数据均不上传。
+# 本地实验数据：原始、逐文件增强、分组结果和无增强对照均不上传。
 /data/
-/data_augmented*/
+/data_augment*/
 /data_prepared*/
 /data_plain*/
 

@@ -209,7 +209,6 @@ def collect_results(
             (experiment_directory(output_root, parsed) / "metrics.json").read_text(encoding="utf-8")
         )
         test, validation = record["test"], record["validation"]
-        robust = record.get("robustness") or {}
         control = record["training_control"]
         rows.append(
             {
@@ -227,9 +226,6 @@ def collect_results(
                 "test_errors": test["n_errors"],
                 "test_cross_entropy": test["cross_entropy"],
                 "test_brier_score": test["brier_score"],
-                "robustness_accuracy": robust.get("exact_match_accuracy", np.nan),
-                "robustness_macro_f1": robust.get("macro_f1_three_class", np.nan),
-                "robustness_errors": robust.get("n_errors", np.nan),
                 "training_seconds": record["training_seconds"],
             }
         )
@@ -246,8 +242,6 @@ def collect_results(
         test_accuracy_mean=("test_accuracy", "mean"),
         test_accuracy_std=("test_accuracy", lambda x: float(x.std(ddof=0))),
         test_macro_f1_mean=("test_macro_f1", "mean"),
-        robustness_accuracy_mean=("robustness_accuracy", "mean"),
-        robustness_accuracy_std=("robustness_accuracy", lambda x: float(x.std(ddof=0))),
         parameters_mean=("trainable_parameters", "mean"),
         training_seconds_mean=("training_seconds", "mean"),
     )
@@ -284,6 +278,7 @@ def collect_results(
         json.dumps(selection, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     plot_accuracy(summary, run_root / "comparison.png")
+    plot_training_curves(all_runs, run_root)
     return all_runs, summary, selection
 
 
@@ -301,11 +296,75 @@ def plot_accuracy(summary: pd.DataFrame, path: Path) -> None:
         offset = (index - (len(architectures) - 1) / 2) * width
         ax.bar(x + offset, values, width, yerr=errors, capsize=3, label=architecture)
     ax.set_xticks(x, [get_representation(name).display_name for name in channels], rotation=12)
-    ax.set(ylim=(0, 1.03), ylabel="原始测试谱正确率", title="模型结构 × 光谱表示")
+    ax.set(ylim=(0, 1.03), ylabel="测试集正确率", title="模型结构 × 光谱表示")
     ax.legend()
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
+
+
+def plot_training_curves(results: pd.DataFrame, run_root: Path) -> List[Path]:
+    """每个模型一张图；四种通道用不同颜色，多种子逐行显示。"""
+    panels = (
+        ("train_loss", "训练损失", None),
+        ("val_loss", "验证损失", None),
+        ("val_accuracy", "验证正确率", (0, 1.03)),
+        ("val_macro_f1", "验证 Macro-F1", (0, 1.03)),
+    )
+    architectures = results["architecture"].drop_duplicates().astype(str).tolist()
+    present = set(results["channel_set"].astype(str))
+    channels = [name for name in available_representations() if name in present]
+    colors = {
+        channel: color
+        for channel, color in zip(
+            channels, plt.get_cmap("tab10")(np.linspace(0, .75, len(channels)))
+        )
+    }
+    paths: List[Path] = []
+    for architecture in architectures:
+        subset_model = results[results["architecture"] == architecture]
+        seeds = sorted(subset_model["training_seed"].astype(int).unique().tolist())
+        fig, axes = plt.subplots(
+            len(seeds), len(panels),
+            figsize=(4.6 * len(panels), 3.8 * len(seeds)),
+            squeeze=False, sharex="row",
+        )
+        for seed_index, seed in enumerate(seeds):
+            for channel in channels:
+                history_path = (
+                    run_root / architecture / channel / f"seed_{seed}" / "history.csv"
+                )
+                if not history_path.is_file():
+                    raise FileNotFoundError(f"缺少训练记录：{history_path}")
+                history = pd.read_csv(history_path)
+                required = {"epoch", *(item[0] for item in panels)}
+                if not required.issubset(history):
+                    raise ValueError(f"训练记录字段不完整：{history_path}")
+                for panel_index, (column, title, limits) in enumerate(panels):
+                    axis = axes[seed_index, panel_index]
+                    axis.plot(
+                        history["epoch"], history[column],
+                        color=colors[channel], label=channel, linewidth=1.8,
+                    )
+                    axis.set(
+                        title=f"seed_{seed} | {title}",
+                        xlabel="轮次", ylabel=title,
+                    )
+                    if limits is not None:
+                        axis.set_ylim(*limits)
+                    axis.grid(alpha=.2)
+            axes[seed_index, 0].legend(title="通道方案", loc="best")
+        fig.suptitle(f"{architecture}：四种递增通道训练过程")
+        fig.tight_layout(rect=(0, 0, 1, .97))
+        path = (
+            run_root / "training_curves.png"
+            if len(architectures) == 1
+            else run_root / f"training_curves_{architecture}.png"
+        )
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        paths.append(path)
+    return paths
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -389,8 +448,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "validation_rank", "architecture", "channel_set",
         "validation_accuracy_mean", "test_accuracy_mean",
     ]
-    if summary["robustness_accuracy_mean"].notna().any():
-        display_columns.append("robustness_accuracy_mean")
     print(summary[display_columns].to_string(index=False))
     print(f"选择: {selection['architecture']}/{selection['channel_set']}/seed_{selection['training_seed']} | {run_root}")
     return 0

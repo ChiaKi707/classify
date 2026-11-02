@@ -94,29 +94,24 @@ def compute_metrics(y_true: np.ndarray, probabilities: np.ndarray) -> Dict[str, 
 def plot_diagnostics(
     history: List[Dict[str, Any]],
     test_matrix: Sequence[Sequence[int]],
-    robustness_matrix: Optional[Sequence[Sequence[int]]],
     path: Path,
     best_epoch: Optional[int] = None,
 ) -> None:
     frame = pd.DataFrame(history)
-    fig, axes = plt.subplots(2, 2, figsize=(11, 9))
-    axes[0, 0].plot(frame["epoch"], frame["train_loss"], label="训练集")
-    axes[0, 0].plot(frame["epoch"], frame["val_loss"], label="验证集")
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+    axes[0].plot(frame["epoch"], frame["train_loss"], label="训练集")
+    axes[0].plot(frame["epoch"], frame["val_loss"], label="验证集")
     if best_epoch is not None:
-        axes[0, 0].axvline(
+        axes[0].axvline(
             best_epoch, color="gray", linestyle="--", label=f"最佳：{best_epoch}"
         )
-    axes[0, 0].set(xlabel="轮次", ylabel="交叉熵", title="训练与验证损失")
-    axes[0, 0].legend()
-    axes[0, 1].plot(frame["epoch"], frame["val_accuracy"], label="正确率")
-    axes[0, 1].plot(frame["epoch"], frame["val_macro_f1"], label="Macro-F1")
-    axes[0, 1].set(xlabel="轮次", ylabel="分数", ylim=(0, 1.02), title="验证集")
-    axes[0, 1].legend()
-    _draw_confusion(axes[1, 0], test_matrix, "原始测试谱")
-    if robustness_matrix is None:
-        axes[1, 1].axis("off")
-    else:
-        _draw_confusion(axes[1, 1], robustness_matrix, "增强鲁棒性测试")
+    axes[0].set(xlabel="轮次", ylabel="交叉熵", title="训练与验证损失")
+    axes[0].legend()
+    axes[1].plot(frame["epoch"], frame["val_accuracy"], label="正确率")
+    axes[1].plot(frame["epoch"], frame["val_macro_f1"], label="Macro-F1")
+    axes[1].set(xlabel="轮次", ylabel="分数", ylim=(0, 1.02), title="验证集")
+    axes[1].legend()
+    _draw_confusion(axes[2], test_matrix, "测试集（同组含增强）")
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)

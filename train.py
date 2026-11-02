@@ -110,7 +110,6 @@ def command_train(args: argparse.Namespace) -> Dict[str, Any]:
     train, validation, test = (
         prepared[name] for name in ("train", "validation", "test")
     )
-    robustness = prepared.splits.get("robustness")
 
     output_dir = experiment_directory(args.output_dir, args)
     weight_dir = experiment_directory(args.pt_dir, args)
@@ -118,13 +117,11 @@ def command_train(args: argparse.Namespace) -> Dict[str, Any]:
     weight_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = weight_dir / "best.pt"
 
-    clean_train = train.metadata["augmentation_index"].to_numpy(np.int64) == 0
     preprocessor = SpectralPreprocessor(args.preprocess_clip, channel_set=args.channel_set)
-    preprocessor.fit(train.spectra[clean_train], prepared.axis)
+    preprocessor.fit(train.spectra, prepared.axis)
     x_train = preprocessor.transform(train.spectra)
     x_val = preprocessor.transform(validation.spectra)
     x_test = preprocessor.transform(test.spectra)
-    x_robust = None if robustness is None else preprocessor.transform(robustness.spectra)
 
     loader_options = {
         "num_workers": args.num_workers,
@@ -139,10 +136,6 @@ def command_train(args: argparse.Namespace) -> Dict[str, Any]:
     )
     val_loader = _loader(x_val, validation.targets, args.batch_size * 2, device, args.num_workers)
     test_loader = _loader(x_test, test.targets, args.batch_size * 2, device, args.num_workers)
-    robustness_loader = (
-        None if robustness is None else
-        _loader(x_robust, robustness.targets, args.batch_size * 2, device, args.num_workers)
-    )
 
     model_config = {
         "in_channels": int(x_train.shape[1]),
@@ -168,13 +161,9 @@ def command_train(args: argparse.Namespace) -> Dict[str, Any]:
 
     parameters = sum(item.numel() for item in model.parameters() if item.requires_grad)
     data_counts = f"{len(train.targets)} / {len(validation.targets)} / {len(test.targets)}"
-    data_names = "训练/验证/测试"
-    if robustness is not None:
-        data_counts += f" / {len(robustness.targets)}"
-        data_names += "/鲁棒性"
     print(
         f"[{args.architecture}/{args.channel_set}/seed_{args.train_seed}] {device} | "
-        f"参数 {parameters:,} | {data_counts} ({data_names})"
+        f"参数 {parameters:,} | {data_counts} (训练/验证/测试)"
     )
 
     monitor = ValidationMonitor(args.min_delta, args.patience)
@@ -222,21 +211,22 @@ def command_train(args: argparse.Namespace) -> Dict[str, Any]:
     assert test_true is not None
     test_metrics = compute_metrics(test_true, test_probs)
     test_metrics["cross_entropy"] = test_loss
-    test_metrics["sample_counts"] = {
-        "independent_original_experiments": int(clean_train.sum()) + len(validation.targets) + len(test.targets),
-        "train_original": int(clean_train.sum()),
-        "train_augmented": int((~clean_train).sum()),
-        "train_rows": len(train.targets),
-        "validation_original": len(validation.targets),
-        "test_original": len(test.targets),
-        "robustness_augmented": 0 if robustness is None else len(robustness.targets),
+    original_counts = {
+        name: int((split.metadata["augmentation_index"] == 0).sum())
+        for name, split in (("train", train), ("validation", validation), ("test", test))
     }
-    robustness_metrics = None
-    if robustness_loader is not None:
-        robust_probs, robust_true, robust_loss = predict_loader(model, robustness_loader, device)
-        assert robust_true is not None
-        robustness_metrics = compute_metrics(robust_true, robust_probs)
-        robustness_metrics["cross_entropy"] = robust_loss
+    test_metrics["sample_counts"] = {
+        "independent_parent_experiments": sum(original_counts.values()),
+        "train_original": original_counts["train"],
+        "train_augmented": len(train.targets) - original_counts["train"],
+        "train_rows": len(train.targets),
+        "validation_original": original_counts["validation"],
+        "validation_augmented": len(validation.targets) - original_counts["validation"],
+        "validation_rows": len(validation.targets),
+        "test_original": original_counts["test"],
+        "test_augmented": len(test.targets) - original_counts["test"],
+        "test_rows": len(test.targets),
+    }
 
     saved_args = dict(vars(args))
     prepared_files = preparation_file_paths(prepared.directory)
@@ -276,7 +266,6 @@ def command_train(args: argparse.Namespace) -> Dict[str, Any]:
             "macro_f1": best_validation["macro_f1_three_class"],
         },
         "test": test_metrics,
-        "robustness": robustness_metrics,
         "trainable_parameters": parameters,
         "training_seconds": training_seconds,
     }
@@ -295,7 +284,6 @@ def command_train(args: argparse.Namespace) -> Dict[str, Any]:
         "analyte_names": ANALYTE_NAMES,
         "class_names": CLASS_NAMES,
         "metrics": test_metrics,
-        "robustness_metrics": robustness_metrics,
     }
     torch.save(checkpoint, checkpoint_path)
 
@@ -303,7 +291,6 @@ def command_train(args: argparse.Namespace) -> Dict[str, Any]:
     plot_diagnostics(
         history,
         test_metrics["confusion_matrix"],
-        None if robustness_metrics is None else robustness_metrics["confusion_matrix"],
         output_dir / "diagnostics.png",
         best_epoch=monitor.best_epoch,
     )
@@ -311,8 +298,6 @@ def command_train(args: argparse.Namespace) -> Dict[str, Any]:
         f"  done | best {monitor.best_epoch} | val {monitor.best_loss:.3g} | "
         f"test {test_metrics['exact_match_accuracy']:.4f}"
     )
-    if robustness_metrics is not None:
-        final_line += f" | robust {robustness_metrics['exact_match_accuracy']:.4f}"
     print(final_line)
     print(f"  {output_dir}")
     return {"output_dir": output_dir, "checkpoint_path": checkpoint_path, "metrics": test_metrics}

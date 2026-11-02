@@ -17,7 +17,7 @@ git status --short
 git diff --check
 python -m unittest discover -s tests -p "test_*.py"
 python check.py
-git check-ignore -v data data_prepared data_plain output pt
+git check-ignore -v data data_augment data_prepared data_plain output pt
 ```
 
 先确认终端已激活项目环境，通常提示符会显示 `(pytorch)`。如果 `python` 报告没有 `torch`，说明当前调用的是系统解释器；请先激活 Conda 环境再重试：

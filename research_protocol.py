@@ -17,9 +17,10 @@ import sklearn
 import torch
 
 
-EXPERIMENT_PROTOCOL_VERSION = 4
+EXPERIMENT_PROTOCOL_VERSION = 5
 CODE_FILES = (
-    "config.py", "representations.py", "data.py", "metrics.py", "train.py",
+    "augment_dataset.py", "config.py", "representations.py", "data.py",
+    "metrics.py", "train.py",
     "training_control.py", "research_protocol.py", "models/__init__.py",
     "models/blocks.py", "models/net.py", "models/cnn1d.py",
     "models/resnet1d.py", "models/registry.py",
@@ -46,7 +47,6 @@ def preparation_provenance(directory: Path) -> Dict[str, Any]:
         "config_sha256": sha256_file(config_path),
         "config": config,
         "split_manifest_sha256": sha256_file(directory / "split_manifest.csv"),
-        "augmentation_manifest_sha256": sha256_file(directory / "augmentation_manifest.csv"),
     }
 
 

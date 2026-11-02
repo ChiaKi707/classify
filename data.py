@@ -19,24 +19,19 @@ from torch.utils.data import Dataset
 from config import CHANNEL_SETS, PREPARED_DATA_DIR, ROLE_CLASS_IDS
 
 
-CORE_SPLIT_FILES = {
+SPLIT_FILES = {
     "train": "train.csv",
     "validation": "validation.csv",
     "test": "test.csv",
 }
-SPLIT_FILES = {
-    **CORE_SPLIT_FILES,
-    "robustness": "robustness.csv",
-}
 PREPARATION_SUPPORT_FILES = (
     "split_manifest.csv",
-    "augmentation_manifest.csv",
     "preparation_config.json",
 )
 PREPARED_METADATA = (
     "sample_id", "experiment_id", "source_file", "source_row",
-    "source_csv_line", "original_sample_id", "role", "class_id",
-    "concentration_text", "concentration_group", "split",
+    "source_csv_line", "original_sample_id", "row_description", "role",
+    "class_id", "concentration_text", "concentration_group", "split",
     "augmentation_index", "is_augmented", "repaired_points",
 )
 
@@ -91,6 +86,8 @@ def read_preparation_config(directory: str | Path) -> Dict[str, Any]:
             "请先运行 python augment_dataset.py"
         )
     config = json.loads(path.read_text(encoding="utf-8"))
+    if config.get("method") != "augment_all_then_group_split":
+        raise ValueError("preparation_config.json不是当前的先增强后分组协议")
     try:
         copies = int(config["augmentation"]["copies"])
     except (KeyError, TypeError, ValueError) as exc:
@@ -104,12 +101,8 @@ def read_preparation_config(directory: str | Path) -> Dict[str, Any]:
 
 
 def preparation_file_names(directory: str | Path) -> Tuple[str, ...]:
-    config = read_preparation_config(directory)
-    copies = int(config["augmentation"]["copies"])
-    split_files = list(CORE_SPLIT_FILES.values())
-    if copies > 0:
-        split_files.append(SPLIT_FILES["robustness"])
-    return (*split_files, *PREPARATION_SUPPORT_FILES)
+    read_preparation_config(directory)
+    return (*SPLIT_FILES.values(), *PREPARATION_SUPPORT_FILES)
 
 
 def preparation_file_paths(directory: str | Path) -> list[Path]:
@@ -119,11 +112,8 @@ def preparation_file_paths(directory: str | Path) -> list[Path]:
 
 def prepared_paths(directory: str | Path = PREPARED_DATA_DIR) -> Dict[str, Path]:
     root = Path(directory).expanduser().resolve()
-    config = read_preparation_config(root)
-    names = dict(CORE_SPLIT_FILES)
-    if int(config["augmentation"]["copies"]) > 0:
-        names["robustness"] = SPLIT_FILES["robustness"]
-    return {name: root / filename for name, filename in names.items()}
+    read_preparation_config(root)
+    return {name: root / filename for name, filename in SPLIT_FILES.items()}
 
 
 def require_prepared_data(directory: str | Path = PREPARED_DATA_DIR) -> Path:
@@ -142,7 +132,8 @@ def read_raw_csv(
     path: Path, target_axis: Optional[np.ndarray] = None
 ) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame, bool]:
     """读取原始/未知光谱CSV；前两列是编号和浓度，其余列是波数。"""
-    raw = pd.read_csv(path, header=None)
+    # 先按对象读取，避免实验序号1被自动转成1.0；波数和强度随后单独转数值。
+    raw = pd.read_csv(path, header=None, dtype=object)
     if raw.shape[0] < 2 or raw.shape[1] < 6:
         raise ValueError(f"{path} 格式错误：需要标题行、数据行和至少4个波数点")
 
@@ -268,14 +259,15 @@ def load_prepared_data(directory: str | Path = PREPARED_DATA_DIR) -> PreparedDat
         splits[name] = split
     assert axis is not None
 
-    train, validation, test = (splits[name] for name in CORE_SPLIT_FILES)
-    for name, split in (("validation", validation), ("test", test)):
-        if split.metadata["is_augmented"].any() or (split.metadata["augmentation_index"] != 0).any():
-            raise ValueError(f"{name}.csv只能包含未增强原谱")
-    if not ((train.metadata["augmentation_index"] == 0) == ~train.metadata["is_augmented"]).all():
-        raise ValueError("train.csv的增强编号与标记不一致")
-    if copies == 0 and train.metadata["is_augmented"].any():
-        raise ValueError("无增强数据的train.csv不能包含增强谱")
+    train, validation, test = (splits[name] for name in SPLIT_FILES)
+    for name, split in splits.items():
+        if not (
+            (split.metadata["augmentation_index"] == 0)
+            == ~split.metadata["is_augmented"]
+        ).all():
+            raise ValueError(f"{name}.csv的增强编号与标记不一致")
+        if copies == 0 and split.metadata["is_augmented"].any():
+            raise ValueError(f"无增强数据的{name}.csv不能包含增强谱")
 
     experiment_sets = {
         name: set(split.metadata["experiment_id"].astype(str))
@@ -291,32 +283,16 @@ def load_prepared_data(directory: str | Path = PREPARED_DATA_DIR) -> PreparedDat
         if set(splits[name].targets.tolist()) != set(ROLE_CLASS_IDS.values()):
             raise ValueError(f"{name}.csv未同时包含三个类别")
 
-    expected_train_indices = set(range(copies + 1))
-    train_groups = train.metadata.groupby("experiment_id")["augmentation_index"]
-    if not all(
-        len(values) == copies + 1 and set(values) == expected_train_indices
-        for _, values in train_groups
-    ):
-        raise ValueError("train.csv中每个实验必须恰有一条原谱和配置数量的增强谱")
-    if copies > 0:
-        robustness = splits["robustness"]
-        if (
-            (~robustness.metadata["is_augmented"]).any()
-            or (robustness.metadata["augmentation_index"] <= 0).any()
-        ):
-            raise ValueError("robustness.csv只能包含测试父谱的增强版本")
-        if set(robustness.metadata["experiment_id"].astype(str)) != experiment_sets["test"]:
-            raise ValueError("robustness父实验必须与test完全一致")
-        expected_robust_indices = set(range(1, copies + 1))
-        robust_groups = robustness.metadata.groupby("experiment_id")["augmentation_index"]
+    expected_indices = set(range(copies + 1))
+    for name, split in splits.items():
+        groups = split.metadata.groupby("experiment_id")["augmentation_index"]
         if not all(
-            len(values) == copies and set(values) == expected_robust_indices
-            for _, values in robust_groups
+            len(values) == copies + 1 and set(values) == expected_indices
+            for _, values in groups
         ):
-            raise ValueError("robustness.csv中每个测试实验必须有完整增强副本")
-    for name in ("validation", "test"):
-        if splits[name].metadata["experiment_id"].duplicated().any():
-            raise ValueError(f"{name}.csv中每个实验只能出现一次")
+            raise ValueError(
+                f"{name}.csv中每个父实验必须包含一条原谱和配置数量的增强谱"
+            )
 
     all_metadata = pd.concat(
         [split.metadata for split in splits.values()], ignore_index=True
@@ -332,12 +308,6 @@ def load_prepared_data(directory: str | Path = PREPARED_DATA_DIR) -> PreparedDat
     actual_assignment = dict(zip(split_manifest["experiment_id"].astype(str), split_manifest["split"].astype(str)))
     if actual_assignment != expected_assignment:
         raise ValueError("split_manifest.csv与数据CSV的实验拆分不一致")
-    augmentation_manifest = pd.read_csv(root / "augmentation_manifest.csv", usecols=["sample_id"])
-    if augmentation_manifest["sample_id"].duplicated().any() or set(
-        augmentation_manifest["sample_id"].astype(str)
-    ) != set(all_metadata["sample_id"].astype(str)):
-        raise ValueError("augmentation_manifest.csv与生成数据行不一致")
-
     for item in config.get("output_files", []):
         path = root / str(item.get("name", ""))
         if not path.is_file() or sha256_file(path) != item.get("sha256"):

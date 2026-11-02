@@ -136,7 +136,9 @@ class TrainingSelectionIntegrationTests(unittest.TestCase):
                 frame.to_csv(source/name, index=False, encoding='utf-8-sig')
             with contextlib.redirect_stdout(io.StringIO()):
                 prepare_data([
-                    '--source-dir', str(source), '--output-dir', str(root/'prepared'),
+                    '--source-dir', str(source),
+                    '--augmented-dir', str(root/'augmented'),
+                    '--prepared-dir', str(root/'prepared'),
                     '--copies', '1', '--steps', '1',
                 ])
             arguments = ['--epochs', '8', '--patience', '3', '--min-delta', '.0001',

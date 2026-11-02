@@ -86,7 +86,6 @@ def result_row(
     experiment = record["experiment"]
     validation = record["validation"]
     test = record["test"]
-    robust = record.get("robustness") or {}
     control = record["training_control"]
     return {
         "source_run": run_root.name,
@@ -104,9 +103,6 @@ def result_row(
         "test_errors": test["n_errors"],
         "test_cross_entropy": test["cross_entropy"],
         "test_brier_score": test["brier_score"],
-        "robustness_accuracy": robust.get("exact_match_accuracy", np.nan),
-        "robustness_macro_f1": robust.get("macro_f1_three_class", np.nan),
-        "robustness_errors": robust.get("n_errors", np.nan),
         "training_seconds": record["training_seconds"],
         "metrics_file": str(metrics_path),
         "checkpoint": str(checkpoint),
@@ -212,8 +208,6 @@ def summarize(results: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         test_accuracy_mean=("test_accuracy", "mean"),
         test_accuracy_std=("test_accuracy", lambda x: float(x.std(ddof=0))),
         test_macro_f1_mean=("test_macro_f1", "mean"),
-        robustness_accuracy_mean=("robustness_accuracy", "mean"),
-        robustness_accuracy_std=("robustness_accuracy", lambda x: float(x.std(ddof=0))),
         parameters_mean=("trainable_parameters", "mean"),
         training_seconds_mean=("training_seconds", "mean"),
     )
@@ -331,7 +325,7 @@ def plot_all_confusions(
                     )
     assert image is not None
     fig.colorbar(image, ax=axes.ravel().tolist(), label="真实类别内比例（%）", shrink=.8)
-    fig.suptitle("全部模型 × 通道方案：原始测试集混淆矩阵")
+    fig.suptitle("全部模型 × 通道方案：测试集混淆矩阵")
     fig.savefig(path, dpi=180)
     plt.close(fig)
 
@@ -460,8 +454,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "model_rank", "architecture", "channel_set",
         "validation_accuracy_mean", "test_accuracy_mean", "parameters_mean",
     ]
-    if model_summary["robustness_accuracy_mean"].notna().any():
-        display_columns.insert(-1, "robustness_accuracy_mean")
     print(model_summary[display_columns].to_string(index=False))
     print(f"选择: {selection['architecture']}/{selection['channel_set']} | {output_dir}")
     return 0

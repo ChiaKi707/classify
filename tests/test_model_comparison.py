@@ -3,7 +3,6 @@
 
 import unittest
 
-import numpy as np
 import pandas as pd
 
 from compare_models import select_model, summarize
@@ -31,7 +30,6 @@ class ModelComparisonTests(unittest.TestCase):
                         "best_validation_macro_f1": validation + offset,
                         "test_accuracy": .99 if architecture == "cnn1d" else .60,
                         "test_macro_f1": .99 if architecture == "cnn1d" else .60,
-                        "robustness_accuracy": .75,
                         "training_seconds": 1.0,
                         "checkpoint": f"{architecture}-{channel_set}-{seed}.pt",
                         "metrics_file": f"{architecture}-{channel_set}-{seed}.json",
@@ -53,7 +51,7 @@ class ModelComparisonTests(unittest.TestCase):
             "测试正确率更高不能改变验证集选模结果",
         )
 
-    def test_plain_dataset_results_allow_missing_robustness(self):
+    def test_summary_without_legacy_robustness_columns(self):
         rows = []
         for architecture, score in (("cnn1d", .8), ("resnet1d", .85)):
             rows.append(
@@ -67,14 +65,13 @@ class ModelComparisonTests(unittest.TestCase):
                     "best_validation_macro_f1": score,
                     "test_accuracy": score,
                     "test_macro_f1": score,
-                    "robustness_accuracy": np.nan,
                     "training_seconds": 1.0,
                     "checkpoint": f"{architecture}.pt",
                     "metrics_file": f"{architecture}.json",
                 }
             )
         summary, model_summary = summarize(pd.DataFrame(rows))
-        self.assertTrue(summary["robustness_accuracy_mean"].isna().all())
+        self.assertNotIn("robustness_accuracy_mean", summary)
         self.assertEqual(model_summary.iloc[0]["architecture"], "resnet1d")
 
 

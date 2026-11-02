@@ -194,10 +194,10 @@ def main() -> int:
 
         run(project / "augment_dataset.py", [], temp)
         prepared = load_prepared_data(project / "data_prepared")
-        expected_counts = {"train": 840, "validation": 36, "test": 36, "robustness": 144}
+        expected_counts = {"train": 840, "validation": 180, "test": 180}
         require(
             {name: len(prepared[name].targets) for name in expected_counts} == expected_counts,
-            "70/15/15拆分或仅训练集增强数量错误",
+            "全量增强后的70/15/15父实验分组数量错误",
         )
         train_metadata = prepared["train"].metadata
         require((train_metadata["augmentation_index"] == 0).sum() == 168,
@@ -207,12 +207,10 @@ def main() -> int:
         split_manifest = pd.read_csv(project / "data_prepared/split_manifest.csv")
         require(len(split_manifest) == 240 and split_manifest["experiment_id"].is_unique,
                 "拆分清单必须一行对应一个独立实验")
-        augmentation_manifest = pd.read_csv(
-            project / "data_prepared/augmentation_manifest.csv"
-        )
+        augmentation_manifest = pd.read_csv(project / "data_augment/augmentation_manifest.csv")
         augmented = augmentation_manifest[augmentation_manifest["is_augmented"]]
         traces = [json.loads(value) for value in augmented["operation_trace"]]
-        require(all(len(trace) == 2 for trace in traces), "每份增强谱必须保留两轮操作记录")
+        require(all(len(trace) == 5 for trace in traces), "每份增强谱必须保留五轮操作记录")
         require(
             all(
                 {"shift_applied", "gain_applied", "noise_applied"}.issubset(step)
@@ -220,9 +218,28 @@ def main() -> int:
             ),
             "三种保守增强的追踪信息不完整",
         )
+        require(
+            all((project / "data_augment" / filename).is_file() for _, filename in RAW_SOURCES),
+            "data_augment必须为每个原始CSV保留同名增强结果",
+        )
+        all_metadata = pd.concat(
+            [split.metadata for split in prepared.splits.values()], ignore_index=True
+        )
+        require(
+            all_metadata.groupby("experiment_id")["split"].nunique().max() == 1,
+            "同一父实验的原谱与增强副本不能跨集合",
+        )
+        require(
+            all_metadata["experiment_id"].str.count(":").min() >= 2,
+            "父实验ID必须包含文件名、行描述和实验序号",
+        )
         run(
             project / "augment_dataset.py",
-            ["--copies", "0", "--output-dir", str(project / "data_plain")],
+            [
+                "--copies", "0",
+                "--augmented-dir", str(project / "data_plain_augment"),
+                "--prepared-dir", str(project / "data_plain"),
+            ],
             temp,
         )
         plain = load_prepared_data(project / "data_plain")
@@ -241,7 +258,7 @@ def main() -> int:
         perfect = np.eye(3) * .98 + (1 - np.eye(3)) * .01
         require(compute_metrics(np.arange(3), perfect)["exact_match_accuracy"] == 1,
                 "三分类指标计算错误")
-        print("3/5 增强/无增强显式拆分、数据隔离和预处理检查通过。", flush=True)
+        print("3/5 逐文件增强、父实验分组、数据隔离和预处理检查通过。", flush=True)
 
         output_root = project / "output"
         pt_root = project / "pt"
@@ -262,8 +279,12 @@ def main() -> int:
             checkpoint = load_checkpoint(weight, torch.device("cpu"))
             require(checkpoint["model_config"]["in_channels"] == channels,
                     f"{channel_set}权重通道数错误")
-            require(record["test"]["n_samples"] == 36, "主测试集数量错误")
-            require(record["robustness"]["n_samples"] == 144, "鲁棒性集数量错误")
+            require(record["test"]["n_samples"] == 180, "测试集增强后数量错误")
+            require(
+                record["test"]["sample_counts"]["test_original"] == 36
+                and record["test"]["sample_counts"]["test_augmented"] == 144,
+                "测试集父实验与增强行计数错误",
+            )
             require(record["training_policy_version"] == TRAINING_POLICY_VERSION,
                     "训练结果缺少当前权重选择协议")
             require(
@@ -275,7 +296,7 @@ def main() -> int:
         require(
             root_files == {
                 "config.json", "split.csv", "results.csv", "summary.csv",
-                "selected_model.json", "comparison.png",
+                "selected_model.json", "comparison.png", "training_curves.png",
             },
             "实验矩阵顶层结果文件不符合精简协议",
         )
@@ -325,7 +346,7 @@ def main() -> int:
         )
         print("5/5 选定模型预测、非法参数和旧结果误用检查通过。", flush=True)
 
-    print("全部自检通过；临时数据和结果已清理，真实data/pt/output未改动。")
+    print("全部自检通过；临时数据和结果已清理，真实data/data_augment/data_prepared/pt/output未改动。")
     print("自检只验证软件流程，不代表真实实验准确率。")
     return 0
 

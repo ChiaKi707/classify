@@ -16,12 +16,13 @@ from representations import available_representations, get_representation
 # 默认目录以当前工程为基准，复制整个工程后无需更改路径。
 ROOT = Path(__file__).resolve().parent
 RAW_DATA_DIR = ROOT / "data"
+AUGMENTED_DATA_DIR = ROOT / "data_augment"
 PREPARED_DATA_DIR = ROOT / "data_prepared"
 PT_DIR = ROOT / "pt"
 OUTPUT_DIR = ROOT / "output"
 
-# 版本7使用显式的train/validation/test/robustness离线数据协议。
-CHECKPOINT_FORMAT_VERSION = 7
+# 版本8使用“全量离线增强后按父实验分组拆分”的三集合数据协议。
+CHECKPOINT_FORMAT_VERSION = 8
 TASK_NAME = "three_class_reagent_presence"
 
 RAW_SOURCES = (

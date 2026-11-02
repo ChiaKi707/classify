@@ -6,8 +6,9 @@
 
 ```text
 数据协议 data_regime
-├─ data_prepared：训练集离线增强，测试增强只作鲁棒性评价
-└─ data_plain：训练、验证、测试全部使用原始光谱
+├─ data_augment：四个原始CSV各自生成“原谱+全部增强副本”对应文件
+├─ data_prepared：按父实验整体划分后的增强训练/验证/测试集
+└─ data_plain：可选无增强对照，使用相同的父实验分组规则
 
 模型 architecture
 ├─ msnet：多尺度残差 + SE + 平均/最大/注意力池化
@@ -35,10 +36,10 @@
 
 ## 2. 数据含义与拆分
 
-`data/` 中每一行表示一次独立实验，实验ID为：
+`data/` 中每一行表示一次独立实验。第二列是行描述，第一列是该实验的序号。父实验ID为：
 
 ```text
-experiment_id = 源文件名（不含扩展名） + ":" + 原始编号
+experiment_id = 源文件名（不含扩展名） + ":" + 行描述 + ":" + 实验序号
 ```
 
 当前四个原始CSV共2001条独立实验。程序按 `source_file × concentration_group` 联合分层，以固定种子66进行70%/15%/15%拆分：
@@ -49,9 +50,9 @@ experiment_id = 源文件名（不含扩展名） + ":" + 原始编号
 | validation | 300 | 早停、通道选择、模型选择 |
 | test | 301 | 锁定模型后的最终报告 |
 
-增强协议中，每条训练原谱再生成4份副本，因此 `train.csv` 共7000行；测试原谱的1204条增强副本单独进入 `robustness.csv`，不参与训练和选模。无增强协议的训练集仍为1400行，并且没有鲁棒性文件。
+程序先对全部2001个父实验分别生成4份增强副本，再按父实验ID整体划分。默认情况下 `data_augment/` 共10005行；`train.csv`、`validation.csv`、`test.csv` 分别为7000、1500、1505行，对应1400、300、301个独立父实验。一个父实验的原谱和4份增强谱绝不会跨集合。
 
-工程遵循“先拆分独立原始实验，再只增强训练父样本”的原则，避免原谱与其轻微扰动副本跨集合造成泄漏。拆分实现使用 scikit-learn 的 [`train_test_split`](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.train_test_split.html)，数据隔离原则参考其[数据泄漏说明](https://scikit-learn.org/stable/common_pitfalls.html)。详细实现见 [DATA_PREPARATION_PLAN.md](DATA_PREPARATION_PLAN.md)。
+拆分实现使用 scikit-learn 的 [`train_test_split`](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.train_test_split.html)。数据隔离原则参考其[数据泄漏说明](https://scikit-learn.org/stable/common_pitfalls.html)，但本工程按用户指定采用“先全量增强、再按父实验组拆分”：防泄漏的关键是所有派生版本共享同一个父实验ID并整体进入同一集合。详细实现见 [DATA_PREPARATION_PLAN.md](DATA_PREPARATION_PLAN.md)。
 
 ## 3. 完整工程流程
 
@@ -59,10 +60,11 @@ experiment_id = 源文件名（不含扩展名） + ":" + 原始编号
 data/*.csv
    │
    ├─ python augment_dataset.py
-   │      └─ data_prepared/：增强训练集 + 干净验证/测试 + 鲁棒性集
+   │      ├─ data_augment/：每个原始文件对应一份完整增强CSV
+   │      └─ data_prepared/：按父实验组划分的train/validation/test
    │
-   └─ python augment_dataset.py --copies 0 --output-dir data_plain
-          └─ data_plain/：干净训练/验证/测试
+   └─ python augment_dataset.py --copies 0 ...
+          └─ data_plain_augment/ + data_plain/：无增强对照
 
 准备数据目录
    │
@@ -81,7 +83,7 @@ selected_model.json 或 best.pt
    └─ predict.py：预测未知CSV
 ```
 
-测试集不参与预处理拟合、权重更新、早停、通道选择或模型选择。
+预处理参数只由 `train.csv` 拟合。测试集不参与预处理拟合、权重更新、早停、通道选择或模型选择。
 
 ## 4. 工程目录
 
@@ -95,7 +97,7 @@ R6gMg_classify/
 │  ├─ resnet1d.py               经典ResNet基线
 │  └─ registry.py               模型注册表
 ├─ tests/                       接口、选模、早停回归测试
-├─ augment_dataset.py           拆分 + 离线增强/无增强数据生成
+├─ augment_dataset.py           逐文件增强 + 父实验分组数据生成
 ├─ data.py                      CSV读取、数据协议校验、光谱预处理
 ├─ representations.py           四种累积输入表示注册表
 ├─ train.py                     单个组合训练入口
@@ -114,7 +116,7 @@ R6gMg_classify/
 └─ GIT_GITHUB.md                Git与GitHub发布步骤
 ```
 
-以下目录只存在于本地并被 `.gitignore` 排除：`data*/`、`pt*/`、`output*/`、虚拟环境和缓存。
+以下目录只存在于本地并被 `.gitignore` 排除：`data/`、`data_augment*/`、`data_prepared*/`、`data_plain*/`、`pt*/`、`output*/`、虚拟环境和缓存。
 
 ## 5. 环境与数据准备
 
@@ -134,13 +136,15 @@ python -m pip install -r requirements.txt
 python augment_dataset.py
 ```
 
+默认每条原谱生成4份增强谱，每份连续执行5轮平移、增益和高斯噪声；默认噪声标准差为当前谱标准差的0.010，终端按三个阶段和四个源文件打印简洁进度。
+
 生成相同拆分的无增强对照：
 
 ```powershell
-python augment_dataset.py --copies 0 --output-dir data_plain
+python augment_dataset.py --copies 0 --augmented-dir data_plain_augment --prepared-dir data_plain
 ```
 
-目标目录已存在时，确认后添加 `--overwrite`。两种数据使用相同原始文件、比例和拆分种子时，`split_manifest.csv` 应完全一致。
+目标目录已存在时，确认后添加 `--overwrite`。增强与无增强实验使用相同原始文件、比例和拆分种子时，`split_manifest.csv` 应完全一致。
 
 ## 6. 训练命令
 
@@ -195,6 +199,7 @@ output/<run_id>/
 ├─ results.csv                 每个表示和种子的逐次指标
 ├─ summary.csv                 多种子均值、标准差和验证排名
 ├─ comparison.png              四种表示的测试正确率
+├─ training_curves.png          四种表示用四种颜色叠加的训练过程
 ├─ selected_model.json         按验证规则选出的权重
 ├─ split.csv                   本轮使用的固定拆分
 └─ config.json                 有效配置快照
@@ -226,7 +231,7 @@ pt/<run_id>/<architecture>/<channel_set>/seed_<n>/best.pt
 1. 用验证正确率、验证Macro-F1、验证损失和参数量完成排名；
 2. 查看跨种子均值与标准差，排除幸运种子；
 3. 再报告测试Accuracy、Macro-F1、错误数和混淆矩阵；
-4. 增强实验额外报告鲁棒性结果；
+4. 同时报告测试行数和独立父实验数，不能把同一父实验的增强副本当作新的独立实验；
 5. 若内部测试全部接近100%，应说明性能饱和，不能据此宣称复杂模型显著更优。
 
 Macro-F1先分别计算三个类别的F1，再等权平均，因此能防止样本较多的“两者都有”类别掩盖其他类别的错误。
