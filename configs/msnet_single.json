@@ -1,0 +1,30 @@
+{
+  "run_id": "msnet_single",
+  "prepared_dir": "data_prepared",
+  "architectures": [
+    {
+      "name": "msnet",
+      "model_options": {}
+    }
+  ],
+  "channel_sets": [
+    "raw",
+    "raw_snv",
+    "raw_snv_d1",
+    "raw_snv_d1_d2"
+  ],
+  "training_seeds": [66],
+  "training": {
+    "epochs": 120,
+    "batch_size": 32,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.0001,
+    "dropout": 0.15,
+    "patience": 20,
+    "min_delta": 0.0001,
+    "grad_clip": 5.0,
+    "preprocess_clip": 10.0,
+    "device": "auto",
+    "num_workers": 0
+  }
+}

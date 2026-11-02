@@ -15,7 +15,8 @@ import numpy as np
 import pandas as pd
 import torch
 
-from config import DEFAULT_DATA
+from augment_dataset import main as prepare_data
+from config import RAW_SOURCES
 from predict import load_checkpoint
 import train
 from training_control import TRAINING_POLICY_VERSION, ValidationMonitor
@@ -121,52 +122,68 @@ class TrainingSelectionIntegrationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix='spectra_selection_') as temporary:
             root = Path(temporary)
+            source = root/'data'
+            source.mkdir()
+            axis = np.linspace(600, 1800, 16)
+            for role, name in RAW_SOURCES:
+                offset = {'mg': 0., 'r6g': 1., 'both': 2.}[role]
+                frame = pd.DataFrame(
+                    np.tile(np.linspace(0, 1, 16), (20, 1)) + offset,
+                    columns=axis,
+                )
+                frame.insert(0, '浓度', ['10^-3']*10 + ['10^-4']*10)
+                frame.insert(0, '编号', np.arange(1, 21))
+                frame.to_csv(source/name, index=False, encoding='utf-8-sig')
+            with contextlib.redirect_stdout(io.StringIO()):
+                prepare_data([
+                    '--source-dir', str(source), '--output-dir', str(root/'prepared'),
+                    '--copies', '1', '--steps', '1',
+                ])
             arguments = ['--epochs', '8', '--patience', '3', '--min-delta', '.0001',
-                         '--group-size', '1', '--device', 'cpu',
+                         '--device', 'cpu', '--prepared-dir', str(root/'prepared'),
                          '--output-dir', str(root/'output'), '--pt-dir', str(root/'pt')]
-            for role, name in DEFAULT_DATA:
-                frame = pd.DataFrame(np.ones((3, 16)), columns=np.linspace(600, 1800, 16))
-                frame.insert(0, '浓度', ['10^-3']*3)
-                frame.insert(0, '编号', [1, 2, 3])
-                path = root/name
-                frame.to_csv(path, index=False, encoding='utf-8-sig')
-                arguments.extend(['--data', f'{role}={path}'])
             args = train.build_parser().parse_args(arguments)
             with patch.object(train, 'train_epoch', side_effect=fake_train_epoch), \
                     patch.object(train, 'predict_loader', side_effect=fake_predict), \
                     contextlib.redirect_stdout(io.StringIO()):
                 train.command_train(args)
 
-            directory = root/'output/model3'
-            checkpoint = load_checkpoint(root/'pt/model3/best.pt', torch.device('cpu'))
-            metrics = json.loads((directory/'test_metrics.json').read_text(encoding='utf-8'))
-            config = json.loads((directory/'training_config.json').read_text(encoding='utf-8'))
-            history = pd.read_csv(directory/'tables/training_history.csv')
+            directory = root/'output/manual/msnet/raw_snv_d1/seed_66'
+            checkpoint_path = root/'pt/manual/msnet/raw_snv_d1/seed_66/best.pt'
+            checkpoint = load_checkpoint(checkpoint_path, torch.device('cpu'))
+            record = json.loads((directory/'metrics.json').read_text(encoding='utf-8'))
+            metrics = record['test']
+            history = pd.read_csv(directory/'history.csv')
             self.assertEqual(epoch, 5)
             self.assertEqual(tested_epoch, 3)
             self.assertTrue(torch.equal(checkpoint['model_state']['classifier.bias'],
                                         torch.full((3,), 3.0)))
-            self.assertEqual(metrics['best_epoch'], 3)
-            self.assertEqual(metrics['best_validation_loss'], min(losses))
-            self.assertEqual(metrics['early_stopping_reference_epoch'], 2)
-            self.assertEqual(metrics['epochs_completed'], 5)
-            self.assertTrue(metrics['stopped_early'])
-            self.assertEqual(metrics['training_policy_version'], TRAINING_POLICY_VERSION)
-            self.assertEqual(checkpoint['training_control'], config['training_control'])
+            self.assertEqual(record['validation']['best_epoch'], 3)
+            self.assertEqual(record['validation']['loss'], min(losses))
+            self.assertEqual(record['training_control']['early_stopping_reference_epoch'], 2)
+            self.assertEqual(record['training_control']['epochs_completed'], 5)
+            self.assertTrue(record['training_control']['stopped_early'])
+            self.assertEqual(record['training_policy_version'], TRAINING_POLICY_VERSION)
+            self.assertEqual(checkpoint['training_control'], record['training_control'])
             self.assertEqual(json.loads(json.dumps(checkpoint['metrics'], ensure_ascii=False)),
                              metrics)
             self.assertEqual(checkpoint['training_policy_version'], TRAINING_POLICY_VERSION)
-            self.assertEqual(config['training_policy_version'], TRAINING_POLICY_VERSION)
+            self.assertEqual(record['training_policy_version'], TRAINING_POLICY_VERSION)
             self.assertEqual(history.loc[history.val_loss.idxmin(), 'epoch'], 3)
-            self.assertEqual(history.checkpoint_updated.tolist(),
-                             [True, True, True, False, False])
-            self.assertEqual(history.epochs_without_significant_improvement.tolist(),
-                             [0, 0, 1, 2, 3])
-            chinese = pd.read_csv(directory/'tables/训练记录.csv')
-            self.assertIn('是否更新最低损失权重', chinese)
-            summary = (directory/'结果摘要.txt').read_text(encoding='utf-8')
-            self.assertIn('最佳训练轮次：3', summary)
-            self.assertIn('早停参考轮次：2', summary)
+            self.assertEqual(
+                list(history),
+                ['epoch', 'learning_rate', 'train_loss', 'val_loss',
+                 'val_accuracy', 'val_macro_f1'],
+            )
+            self.assertGreater((directory/'diagnostics.png').stat().st_size, 0)
+            self.assertEqual(
+                {path.name for path in directory.iterdir()},
+                {'metrics.json', 'history.csv', 'diagnostics.png'},
+            )
+            self.assertEqual(
+                {path.name for path in checkpoint_path.parent.iterdir()},
+                {'best.pt'},
+            )
 
 
 if __name__ == '__main__':

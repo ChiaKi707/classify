@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""三分类批量推理、指标计算、结果表格与中文绘图。"""
+"""三分类推理、核心指标和精简诊断图。"""
 
 from __future__ import annotations
 
@@ -15,13 +15,10 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from sklearn.metrics import (
-    accuracy_score, classification_report, confusion_matrix, f1_score,
-    hamming_loss, precision_recall_fscore_support, roc_auc_score,
-)
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
 from torch.utils.data import DataLoader
 
-from config import ANALYTE_NAMES, CLASS_ANALYTE_TARGETS, CLASS_NAMES
+from config import CLASS_ANALYTE_TARGETS, CLASS_NAMES
 
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Arial Unicode MS", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
@@ -75,88 +72,59 @@ def predict_loader(
 
 def compute_metrics(y_true: np.ndarray, probabilities: np.ndarray) -> Dict[str, Any]:
     true_class = np.asarray(y_true, dtype=np.int64).reshape(-1)
-    pred_class = np.asarray(probabilities).argmax(axis=1).astype(np.int64)
-    binary_true = class_ids_to_analytes(true_class)
-    binary_pred = class_ids_to_analytes(pred_class)
-    analyte_probabilities = class_probabilities_to_analyte_probabilities(probabilities)
-
-    precision, recall, f1, support = precision_recall_fscore_support(
-        binary_true, binary_pred, average=None, zero_division=0
-    )
-    per_analyte: Dict[str, Any] = {}
-    for column, name in enumerate(ANALYTE_NAMES):
-        auc = None
-        if len(np.unique(binary_true[:, column])) == 2:
-            auc = float(roc_auc_score(binary_true[:, column], analyte_probabilities[:, column]))
-        per_analyte[name] = {
-            "precision": float(precision[column]),
-            "recall": float(recall[column]),
-            "f1": float(f1[column]),
-            "support_positive": int(support[column]),
-            "roc_auc": auc,
-        }
-
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    if probabilities.ndim != 2 or probabilities.shape != (len(true_class), len(CLASS_NAMES)):
+        raise ValueError(f"类别概率必须是[{len(true_class)},{len(CLASS_NAMES)}]形状")
+    pred_class = probabilities.argmax(axis=1).astype(np.int64)
     labels = list(range(len(CLASS_NAMES)))
     cm = confusion_matrix(true_class, pred_class, labels=labels)
-    report = classification_report(
-        true_class,
-        pred_class,
-        labels=labels,
-        target_names=CLASS_NAMES,
-        output_dict=True,
-        zero_division=0,
-    )
+    one_hot = np.eye(len(CLASS_NAMES), dtype=np.float64)[true_class]
     return {
+        "n_samples": int(len(true_class)),
+        "n_errors": int(np.count_nonzero(pred_class != true_class)),
+        "brier_score": float(np.mean(np.sum((probabilities - one_hot) ** 2, axis=1))),
         "exact_match_accuracy": float(accuracy_score(true_class, pred_class)),
         "macro_f1_three_class": float(
             f1_score(true_class, pred_class, labels=labels, average="macro", zero_division=0)
         ),
-        # 分浓度、分类别时可能只有部分真实类别，因此同时保存组内实际类别平均F1。
-        "macro_f1_observed_class": float(
-            f1_score(
-                true_class,
-                pred_class,
-                labels=np.unique(true_class),
-                average="macro",
-                zero_division=0,
-            )
-        ),
-        "observed_classes": [CLASS_NAMES[value] for value in np.unique(true_class)],
-        "macro_f1_analyte": float(np.mean(f1)),
-        "hamming_loss": float(hamming_loss(binary_true, binary_pred)),
-        "per_analyte": per_analyte,
         "confusion_matrix": cm.tolist(),
-        "classification_report": report,
     }
 
 
-def plot_history(
-    history: List[Dict[str, Any]], path: Path, best_epoch: Optional[int] = None
+def plot_diagnostics(
+    history: List[Dict[str, Any]],
+    test_matrix: Sequence[Sequence[int]],
+    robustness_matrix: Optional[Sequence[Sequence[int]]],
+    path: Path,
+    best_epoch: Optional[int] = None,
 ) -> None:
     frame = pd.DataFrame(history)
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-    axes[0].plot(frame["epoch"], frame["train_loss"], label="训练集")
-    axes[0].plot(frame["epoch"], frame["val_loss"], label="验证集")
+    fig, axes = plt.subplots(2, 2, figsize=(11, 9))
+    axes[0, 0].plot(frame["epoch"], frame["train_loss"], label="训练集")
+    axes[0, 0].plot(frame["epoch"], frame["val_loss"], label="验证集")
     if best_epoch is not None:
-        axes[0].axvline(best_epoch, color="gray", linestyle="--",
-                       label=f"保留权重：第{best_epoch}轮")
-    axes[0].set(xlabel="训练轮次", ylabel="交叉熵损失", title="训练与验证损失")
-    axes[0].legend()
-    axes[1].plot(frame["epoch"], frame["val_exact_accuracy"], label="完全正确率")
-    axes[1].plot(frame["epoch"], frame["val_macro_f1_three_class"], label="三类别平均F1")
-    axes[1].plot(frame["epoch"], frame["val_macro_f1_analyte"], label="成分平均F1")
-    axes[1].set(xlabel="训练轮次", ylabel="分数", ylim=(0, 1.02), title="验证集指标")
-    axes[1].legend()
+        axes[0, 0].axvline(
+            best_epoch, color="gray", linestyle="--", label=f"最佳：{best_epoch}"
+        )
+    axes[0, 0].set(xlabel="轮次", ylabel="交叉熵", title="训练与验证损失")
+    axes[0, 0].legend()
+    axes[0, 1].plot(frame["epoch"], frame["val_accuracy"], label="正确率")
+    axes[0, 1].plot(frame["epoch"], frame["val_macro_f1"], label="Macro-F1")
+    axes[0, 1].set(xlabel="轮次", ylabel="分数", ylim=(0, 1.02), title="验证集")
+    axes[0, 1].legend()
+    _draw_confusion(axes[1, 0], test_matrix, "原始测试谱")
+    if robustness_matrix is None:
+        axes[1, 1].axis("off")
+    else:
+        _draw_confusion(axes[1, 1], robustness_matrix, "增强鲁棒性测试")
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
 
 
-def plot_confusion(matrix: Sequence[Sequence[int]], path: Path) -> None:
+def _draw_confusion(ax: Any, matrix: Sequence[Sequence[int]], title: str) -> None:
     cm = np.asarray(matrix)
-    fig, ax = plt.subplots(figsize=(6.4, 5.4))
-    image = ax.imshow(cm, cmap="Blues")
-    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+    ax.imshow(cm, cmap="Blues")
     ax.set(
         xticks=np.arange(len(CLASS_NAMES)),
         yticks=np.arange(len(CLASS_NAMES)),
@@ -164,15 +132,12 @@ def plot_confusion(matrix: Sequence[Sequence[int]], path: Path) -> None:
         yticklabels=CLASS_NAMES,
         xlabel="预测类别",
         ylabel="真实类别",
-        title="测试集混淆矩阵",
+        title=title,
     )
     for row in range(len(CLASS_NAMES)):
         for column in range(len(CLASS_NAMES)):
             color = "white" if cm[row, column] > cm.max() / 2 else "black"
             ax.text(column, row, str(cm[row, column]), ha="center", va="center", color=color)
-    fig.tight_layout()
-    fig.savefig(path, dpi=180)
-    plt.close(fig)
 
 
 def make_prediction_frame(
@@ -197,53 +162,6 @@ def make_prediction_frame(
         frame["真实类别"] = [CLASS_NAMES[value] for value in true_ids]
         frame["是否正确"] = class_ids == true_ids
     return frame
-
-
-def metrics_by_group(
-    metadata: pd.DataFrame,
-    y_true: np.ndarray,
-    probabilities: np.ndarray,
-    group_column: str,
-) -> pd.DataFrame:
-    """生成消融研究所需的浓度/角色分组指标。"""
-    meta = metadata.reset_index(drop=True)
-    class_true = np.asarray(y_true, dtype=np.int64).reshape(-1)
-    class_pred = np.asarray(probabilities).argmax(axis=1).astype(np.int64)
-    binary_true = class_ids_to_analytes(class_true)
-    binary_pred = class_ids_to_analytes(class_pred)
-    rows: List[Dict[str, Any]] = []
-    for group_value, indices in meta.groupby(group_column, sort=False, dropna=False).indices.items():
-        idx = np.asarray(indices, dtype=np.int64)
-        group_metrics = compute_metrics(class_true[idx], probabilities[idx])
-        row: Dict[str, Any] = {
-            "group": str(group_value),
-            "n_samples": int(len(idx)),
-            "exact_match_accuracy": group_metrics["exact_match_accuracy"],
-            "macro_f1_three_class": group_metrics["macro_f1_three_class"],
-            "macro_f1_observed_class": group_metrics["macro_f1_observed_class"],
-            "macro_f1_analyte": group_metrics["macro_f1_analyte"],
-            "hamming_loss": group_metrics["hamming_loss"],
-        }
-        for column, name in enumerate(ANALYTE_NAMES):
-            true_column = binary_true[idx, column]
-            pred_column = binary_pred[idx, column]
-            positive_mask = true_column == 1
-            negative_mask = ~positive_mask
-            row[f"{name}_positive_support"] = int(positive_mask.sum())
-            row[f"{name}_negative_support"] = int(negative_mask.sum())
-            row[f"{name}_recall"] = (
-                float(np.mean(pred_column[positive_mask] == 1))
-                if positive_mask.any()
-                else np.nan
-            )
-            row[f"{name}_false_positive_rate"] = (
-                float(np.mean(pred_column[negative_mask] == 1))
-                if negative_mask.any()
-                else np.nan
-            )
-            row[f"{name}_f1"] = group_metrics["per_analyte"][name]["f1"]
-        rows.append(row)
-    return pd.DataFrame(rows)
 
 
 def json_default(value: Any):

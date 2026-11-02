@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
@@ -13,12 +14,12 @@ import torch
 from torch.utils.data import DataLoader
 
 from config import (
-    CHECKPOINT_FORMAT_VERSION, CLASS_NAMES, ChineseParser, OUTPUT_DIR, PT_DIR,
+    CHECKPOINT_FORMAT_VERSION, CLASS_NAMES, ChineseParser, OUTPUT_DIR,
     TABLE_COLUMNS_CN, TASK_NAME, choose_device, setup_console,
 )
-from data import SpectralPreprocessor, SpectraDataset, read_spectral_csv
+from data import SpectralPreprocessor, SpectraDataset, read_raw_csv
 from metrics import make_prediction_frame, predict_loader
-from models import ReagentClassMSNet
+from models import build_model
 
 
 def load_checkpoint(path: Path, device: torch.device) -> Dict[str, Any]:
@@ -35,14 +36,32 @@ def load_checkpoint(path: Path, device: torch.device) -> Dict[str, Any]:
     return checkpoint
 
 
+def resolve_checkpoint(args: argparse.Namespace) -> Path:
+    if args.selection:
+        selection_path = Path(args.selection).expanduser().resolve()
+        if not selection_path.is_file():
+            raise FileNotFoundError(f"模型选择文件不存在：{selection_path}")
+        selection = json.loads(selection_path.read_text(encoding="utf-8"))
+        raw_checkpoint = selection.get("checkpoint")
+        if not raw_checkpoint:
+            raise ValueError("模型选择文件缺少checkpoint字段")
+        checkpoint = Path(raw_checkpoint)
+        if not checkpoint.is_absolute():
+            checkpoint = (selection_path.parent / checkpoint).resolve()
+        return checkpoint
+    if args.checkpoint:
+        return Path(args.checkpoint).expanduser().resolve()
+    raise ValueError("必须指定--selection或--checkpoint")
+
+
 def command_predict(args: argparse.Namespace) -> None:
     device = choose_device(args.device)
-    checkpoint_path = Path(args.checkpoint)
+    checkpoint_path = resolve_checkpoint(args)
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"模型文件不存在：{checkpoint_path}")
     checkpoint = load_checkpoint(checkpoint_path, device)
     reference_axis = checkpoint["reference_axis"].cpu().numpy().astype(np.float64)
-    spectra, _, metadata, interpolated = read_spectral_csv(Path(args.input), reference_axis)
+    spectra, _, metadata, interpolated = read_raw_csv(Path(args.input), reference_axis)
     preprocessor = SpectralPreprocessor.from_state_dict(checkpoint["preprocessor"])
     channels = preprocessor.transform(spectra)
     dataset = SpectraDataset(channels)
@@ -53,7 +72,12 @@ def command_predict(args: argparse.Namespace) -> None:
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
-    model = ReagentClassMSNet(**checkpoint["model_config"]).to(device)
+    architecture = str(checkpoint.get("architecture", "msnet"))
+    model = build_model(
+        architecture,
+        **checkpoint["model_config"],
+        model_options=checkpoint.get("model_options", {}),
+    ).to(device)
     model.load_state_dict(checkpoint["model_state"])
     probabilities, _, _ = predict_loader(model, loader, device)
     metadata["source_file"] = str(args.input)
@@ -74,8 +98,9 @@ def command_predict(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = ChineseParser(description="把未知光谱判为仅MG1、仅R6G或两者都有")
     parser.add_argument("--input", required=True, help="与训练数据同格式的未知光谱CSV")
-    parser.add_argument("--checkpoint", default=str(PT_DIR / "model3" / "best.pt"),
-                        help="当前三分类格式的模型文件")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--selection", help="run_experiments生成的selected_model.json")
+    source.add_argument("--checkpoint", help="显式指定best.pt；与--selection二选一")
     parser.add_argument("--output", help="预测CSV路径；默认保存到output/predict")
     parser.add_argument("--batch-size", type=int, default=128, help="每批预测光谱数")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto", help="计算设备")

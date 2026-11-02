@@ -1,13 +1,51 @@
-# 私有实验数据、模型权重与运行结果。
+# 本地实验数据：原始数据、准备数据和临时数据均不上传。
 /data/
-/data_augmented/
-/pt/
-/output/
-/pt_check/
-/output_check/
-# Python、环境与编辑器缓存。
+/data_augmented*/
+/data_prepared*/
+/data_plain*/
+
+# 训练产物：权重、结果、预测和检查目录均可由代码重新生成。
+/pt*/
+/output*/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+/predictions*.csv
+/unknown*.csv
+
+# Python缓存、测试覆盖率与构建产物。
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# 虚拟环境、密钥和本地环境变量。
 .venv/
+venv/
+env/
+.conda/
+.env
+.env.*
+!.env.example
+
+# 编辑器、Notebook与操作系统文件。
 .idea/
 .vscode/
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# 临时文件和日志。
+*.log
+*.tmp
+*.bak
+*.swp
+~$*

@@ -1,0 +1,9 @@
+{
+  "comparison_id": "model_compare_plain_multi",
+  "runs": [
+    "output/msnet_plain",
+    "output/cnn1d_plain",
+    "output/resnet1d_plain"
+  ],
+  "output_dir": "output/model_compare_plain_multi"
+}

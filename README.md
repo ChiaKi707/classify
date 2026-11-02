@@ -1,526 +1,254 @@
-# MG1 / R6G 拉曼光谱三分类工程
+# MG1 / R6G 一维拉曼光谱三分类
 
-## 1. 项目目标
+本工程使用一维拉曼光谱识别三个互斥类别：`仅MG1`、`仅R6G`、`两者都有`。当前研究同时比较三个模型、四种累积光谱表示、增强/无增强两种数据协议以及单种子/多种子训练结果。
 
-本工程使用一维卷积神经网络分析拉曼光谱，将待测样品分为三个互斥类别：
+## 1. 当前研究矩阵
 
-1. 仅含MG1；
-2. 仅含R6G；
-3. 同时含MG1和R6G。
+```text
+数据协议 data_regime
+├─ data_prepared：训练集离线增强，测试增强只作鲁棒性评价
+└─ data_plain：训练、验证、测试全部使用原始光谱
 
-工程的业务前提是每个待测样品至少含一种目标试剂，因此不设置“二者都无”类别。混合比例1:1、1:2、2:1等均归入“两者都有”，模型不预测混合比例和浓度。
+模型 architecture
+├─ msnet：多尺度残差 + SE + 平均/最大/注意力池化
+├─ cnn1d：经典时间序列 FCN 基线
+└─ resnet1d：经典时间序列 ResNet 基线
 
-最终采用模型3，即“标准化原始光谱 + SNV光谱 + 一阶导数”三通道输入。工程同时保留模型1～4的通道递增实验，用于比较不同光谱表示的贡献。
+输入表示 channel_set
+├─ raw                 1通道
+├─ raw_snv             2通道
+├─ raw_snv_d1          3通道
+└─ raw_snv_d1_d2       4通道
 
-## 2. 工程结构
+训练种子 training_seed
+├─ single：66
+└─ multi：66、67、68
+```
 
-~~~text
+一次正式模型比较的规模是：
+
+```text
+3个模型 × 4种表示 × 3个种子 = 36次训练
+```
+
+增强与无增强都完成时合计72次正式训练。每个组合独立初始化，不继承其他组合的权重。
+
+## 2. 数据含义与拆分
+
+`data/` 中每一行表示一次独立实验，实验ID为：
+
+```text
+experiment_id = 源文件名（不含扩展名） + ":" + 原始编号
+```
+
+当前四个原始CSV共2001条独立实验。程序按 `source_file × concentration_group` 联合分层，以固定种子66进行70%/15%/15%拆分：
+
+| 集合 | 独立原谱数 | 用途 |
+|---|---:|---|
+| train | 1400 | 更新模型权重 |
+| validation | 300 | 早停、通道选择、模型选择 |
+| test | 301 | 锁定模型后的最终报告 |
+
+增强协议中，每条训练原谱再生成4份副本，因此 `train.csv` 共7000行；测试原谱的1204条增强副本单独进入 `robustness.csv`，不参与训练和选模。无增强协议的训练集仍为1400行，并且没有鲁棒性文件。
+
+工程遵循“先拆分独立原始实验，再只增强训练父样本”的原则，避免原谱与其轻微扰动副本跨集合造成泄漏。拆分实现使用 scikit-learn 的 [`train_test_split`](https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.train_test_split.html)，数据隔离原则参考其[数据泄漏说明](https://scikit-learn.org/stable/common_pitfalls.html)。详细实现见 [DATA_PREPARATION_PLAN.md](DATA_PREPARATION_PLAN.md)。
+
+## 3. 完整工程流程
+
+```text
+data/*.csv
+   │
+   ├─ python augment_dataset.py
+   │      └─ data_prepared/：增强训练集 + 干净验证/测试 + 鲁棒性集
+   │
+   └─ python augment_dataset.py --copies 0 --output-dir data_plain
+          └─ data_plain/：干净训练/验证/测试
+
+准备数据目录
+   │
+   ├─ train.py：训练一个“模型 × 表示 × 种子”
+   └─ run_experiments.py：运行完整实验矩阵并按验证集排名
+          │
+          ├─ output/<run_id>/：表格、曲线、混淆矩阵、选模记录
+          └─ pt/<run_id>/：best.pt
+
+三个模型各自训练完成
+   │
+   └─ compare_models.py：只读取已有结果，校验公平性并生成模型对比
+
+selected_model.json 或 best.pt
+   │
+   └─ predict.py：预测未知CSV
+```
+
+测试集不参与预处理拟合、权重更新、早停、通道选择或模型选择。
+
+## 4. 工程目录
+
+```text
 R6gMg_classify/
+├─ configs/                     实验与结果比较JSON
 ├─ models/
-│  ├─ __init__.py        模型包入口
-│  ├─ blocks.py          SE注意力和多尺度残差模块
-│  └─ net.py             三分类网络ReagentClassMSNet
-├─ config.py             路径、类别、通道和公共配置
-├─ augment_dataset.py    原始光谱离线扩充脚本
-├─ data.py               扩充CSV读取、来源绑定拆分和预处理
-├─ train.py              单模型训练入口，默认模型3
-├─ training_control.py   最低验证损失选优与独立早停监控
-├─ predict.py            加载权重并预测未知光谱
-├─ run_all.py            依次训练模型1～4并生成对比结果
-├─ metrics.py            Softmax推理、分类指标和绘图
-├─ check.py              独立临时目录中的完整流程自检
-├─ requirements.txt      Python依赖版本
-├─ README.md             工程运行说明
-├─ EXPERIMENTS.md        四模型递增实验说明
-├─ EXPERIMENT_DESIGN.md  网络结构消融和传统基线的扩展建议
-├─ tests/                权重选优与早停的回归测试
-├─ data/                 2001条原始实验光谱
-├─ data_augmented/       离线扩充CSV、扩充清单和参数记录
-├─ pt/                   训练权重目录
-└─ output/               表格、图片和结果摘要目录
-~~~
+│  ├─ blocks.py                 MSNet多尺度残差与SE模块
+│  ├─ net.py                    MSNet
+│  ├─ cnn1d.py                  经典FCN基线
+│  ├─ resnet1d.py               经典ResNet基线
+│  └─ registry.py               模型注册表
+├─ tests/                       接口、选模、早停回归测试
+├─ augment_dataset.py           拆分 + 离线增强/无增强数据生成
+├─ data.py                      CSV读取、数据协议校验、光谱预处理
+├─ representations.py           四种累积输入表示注册表
+├─ train.py                     单个组合训练入口
+├─ run_experiments.py           模型 × 表示 × 种子矩阵入口
+├─ compare_models.py            已完成模型结果比较入口
+├─ predict.py                   未知光谱推理入口
+├─ metrics.py                   指标与单次训练诊断图
+├─ training_control.py          最佳权重与早停逻辑
+├─ research_protocol.py         数据、代码、环境指纹
+├─ check.py                     临时合成数据端到端自检
+├─ README.md                    工程入口与最短运行说明
+├─ DATA_PREPARATION_PLAN.md     数据拆分、增强和校验细节
+├─ EXPERIMENTS.md               完整实验矩阵与评价协议
+├─ MODELS.md                    三个模型、来源和比较解释
+├─ EXPERIMENT_DESIGN.md         后续增加模型/数据的接口约束
+└─ GIT_GITHUB.md                Git与GitHub发布步骤
+```
 
-`models`保存网络结构代码，`pt`保存训练后的权重，`output`保存实验结果。相同模型再次训练时，同名权重和结果文件直接覆盖，不创建额外版本目录。
+以下目录只存在于本地并被 `.gitignore` 排除：`data*/`、`pt*/`、`output*/`、虚拟环境和缓存。
 
-## 3. 环境配置
+## 5. 环境与数据准备
 
-核验环境如下：
+推荐Python 3.12：
 
-~~~text
-Python 3.12
-PyTorch 2.6.0
-NumPy 2.3.4
-pandas 2.3.3
-scikit-learn 1.7.2
-Matplotlib 3.10.6
-~~~
-
-Conda环境创建与依赖安装命令：
-
-~~~powershell
-conda create -n spectra python=3.12
-conda activate spectra
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-~~~
+```
 
-已有PyTorch环境时执行：
+如果已经在项目现有的 Conda 环境中，命令行前缀显示 `(pytorch)` 后可直接使用 `python`。执行 `python --version` 和 `python -c "import torch; print(torch.__version__)"` 可确认没有误用未安装 PyTorch 的系统解释器；本次验证使用 Python 3.12.12 与 PyTorch 2.6.0。
 
-~~~powershell
-conda activate pytorch
-python --version
-python -c "import torch; print(torch.__version__); print('CUDA可用:', torch.cuda.is_available())"
-~~~
+生成增强数据：
 
-默认参数`--device auto`在CUDA可用时使用显卡，否则使用CPU。
-
-## 4. 数据组织
-
-原始实验数据放在`data`：
-
-~~~text
-data/
-├─ MG1.csv
-├─ R6g1.csv
-├─ R6g1_MG1.csv
-└─ R6g1_MG2.csv
-~~~
-
-执行扩充后，脚本在`data_augmented`生成同名训练CSV：
-
-~~~text
-data_augmented/
-├─ MG1.csv
-├─ R6g1.csv
-├─ R6g1_MG1.csv
-├─ R6g1_MG2.csv
-├─ augmentation_manifest.csv
-└─ augmentation_config.json
-~~~
-
-`python train.py`和`python run_all.py`默认读取`data_augmented`，不直接读取原始`data`。
-
-文件角色与三分类标签如下：
-
-| 文件 | 角色 | 类别编号 | 类别名称 |
-|---|---|---:|---|
-| MG1.csv | mg | 0 | 仅MG1 |
-| R6g1.csv | r6g | 1 | 仅R6G |
-| R6g1_MG1.csv | both | 2 | 两者都有 |
-| R6g1_MG2.csv | both | 2 | 两者都有 |
-
-原始数据共2001条独立测量光谱，每条包含524个波数点：
-
-| 类别 | 样本数 |
-|---|---:|
-| 仅MG1 | 500 |
-| 仅R6G | 499 |
-| 两者都有 | 1002 |
-
-CSV格式为：
-
-| 位置 | 第1列 | 第2列 | 第3列及之后 |
-|---|---|---|---|
-| 第一行 | 编号列标题 | 浓度列标题 | 数字波数轴 |
-| 第二行起 | 样本编号 | 浓度文字 | 对应波数上的光谱强度 |
-
-示例：
-
-~~~csv
-编号,浓度,600.85,603.14,605.43,607.72
-1,MG1 10^-2,123.4,125.1,129.7,126.0
-2,MG1 10^-2,122.7,124.8,130.2,126.5
-~~~
-
-浓度文字用于分组拆分和分浓度统计，不作为网络输入。类别由文件角色确定，同一文件只保存同一类别的样品。
-
-## 5. 数据扩充
-
-默认扩充命令：
-
-~~~powershell
+```powershell
 python augment_dataset.py
-~~~
+```
 
-每条原始光谱保留1份，并生成4份彼此独立的增强光谱。每份增强光谱都从原始光谱重新开始，默认重复5轮增强链；每轮对三种操作分别进行一次独立概率抽取，默认执行概率均为0.5，执行顺序固定为：
+生成相同拆分的无增强对照：
 
-~~~text
-1. 波数轴平移：抽中后从-2、-1、0、1、2中等概率选择，边界最近值填充
-2. 强度变化：抽中后整条光谱乘以[0.98, 1.02]均匀分布随机倍率
-3. 加性高斯噪声：抽中后逐点加入零均值噪声，标准差为当前光谱标准差的1%
-~~~
+```powershell
+python augment_dataset.py --copies 0 --output-dir data_plain
+```
 
-高斯噪声在每个波数点独立采样，期望值为0，因此不会有意整体抬高或降低光谱。它用于模拟探测器、电路和测量环境造成的小幅随机波动，使模型减少对单个尖点和微小数值差异的依赖，提高对重复测量噪声的鲁棒性。噪声过大会淹没低浓度特征峰，因此默认只取当前光谱标准差的1%，并且每轮仅有0.5概率执行。
+目标目录已存在时，确认后添加 `--overwrite`。两种数据使用相同原始文件、比例和拆分种子时，`split_manifest.csv` 应完全一致。
 
-`--steps`控制每份增强光谱重复增强链的轮数，默认5；`--copies`控制每条原始光谱生成的增强份数，默认4。两者含义不同。原始版本编号为`00023_0`，4份增强版本编号为`00023_1`～`00023_4`。
+## 6. 训练命令
 
-随机种子固定为66。同一输入和同一参数重复运行会覆盖同名扩充文件，并生成一致的数据。实际数据量为：
+### 6.1 单种子流程
 
-| 数据 | 数量 | 统计含义 |
-|---|---:|---|
-| 独立原始光谱 | 2001 | 真实实验样本量 |
-| 新生成扩充光谱 | 8004 | 2001×4 |
-| 扩充CSV总行数 | 10005 | 2001×5 |
+增强数据：
 
-`augmentation_manifest.csv`逐行记录原始文件、原始行号、缺失点修复数、扩充编号、三种操作的实际执行次数和5轮完整操作轨迹；`augmentation_config.json`记录随机种子、概率、幅度、轮数、数量及原始文件SHA-256指纹。
+```powershell
+python run_experiments.py --config configs\msnet_single.json
+python run_experiments.py --config configs\cnn1d_single.json
+python run_experiments.py --config configs\resnet1d_single.json
+python compare_models.py --config configs\compare_single.json
+```
 
-完整显式命令：
+无增强数据：
 
-~~~powershell
-python augment_dataset.py --copies 4 --steps 5 --shift-prob 0.5 --gain-prob 0.5 --noise-prob 0.5 --shift-points 2 --gain-min 0.98 --gain-max 1.02 --noise-ratio 0.01 --seed 66
-~~~
+```powershell
+python run_experiments.py --config configs\msnet_single.json --prepared-dir data_plain --run-id msnet_plain_single
+python run_experiments.py --config configs\cnn1d_single.json --prepared-dir data_plain --run-id cnn1d_plain_single
+python run_experiments.py --config configs\resnet1d_single.json --prepared-dir data_plain --run-id resnet1d_plain_single
+python compare_models.py --config configs\compare_plain_single.json
+```
 
-训练期间不再随机改变光谱。离线扩充CSV是固定实验输入，可直接归档和复核。
+### 6.2 正式多种子流程
 
-自定义扩充文件路径命令：
+增强数据：
 
-~~~powershell
-python train.py --data mg=data_augmented/MG1.csv --data r6g=data_augmented/R6g1.csv --data both=data_augmented/R6g1_MG1.csv --data both=data_augmented/R6g1_MG2.csv
-~~~
+```powershell
+python run_experiments.py --config configs\msnet_multi.json
+python run_experiments.py --config configs\cnn1d_multi.json
+python run_experiments.py --config configs\resnet1d_multi.json
+python compare_models.py --config configs\compare_multi.json
+```
 
-手动指定`--data`后，mg、r6g、both三个类别必须同时存在。
+无增强数据：
 
-## 6. 模型与输入通道
+```powershell
+python run_experiments.py --config configs\msnet_multi.json --prepared-dir data_plain --run-id msnet_plain
+python run_experiments.py --config configs\cnn1d_multi.json --prepared-dir data_plain --run-id cnn1d_plain
+python run_experiments.py --config configs\resnet1d_multi.json --prepared-dir data_plain --run-id resnet1d_plain
+python compare_models.py --config configs\compare_plain_multi.json
+```
 
-四个模型共用同一网络主体，仅输入通道不同：
+`--skip-existing` 只复用数据哈希、代码指纹和参数都严格一致的完整结果；`--summary-only` 只重新汇总已有完整结果；`--dry-run` 只检查配置并打印将要执行的训练命令。
 
-| 模型 | 输入通道 | 参数量 |
-|---|---|---:|
-| 模型1 | 标准化原始光谱 | 72,088 |
-| 模型2 | 原始 + SNV | 72,256 |
-| 模型3 | 原始 + SNV + 一阶导数 | 72,424 |
-| 模型4 | 原始 + SNV + 一阶导数 + 二阶导数 | 72,592 |
+## 7. 输出与判断顺序
 
-模型3的主要结构为：
+每个模型实验根目录：
 
-~~~text
-[B,3,524]
-  → Conv1d(3→24, kernel=7) + BatchNorm + GELU
-  → 多尺度残差块(24→32) + MaxPool
-  → 多尺度残差块(32→48) + MaxPool
-  → 多尺度残差块(48→64)
-  → 平均池化 + 最大池化 + 注意力池化
-  → 全连接层[B,64]
-  → 三分类输出层[B,3]
-  → Softmax类别概率
-~~~
+```text
+output/<run_id>/
+├─ results.csv                 每个表示和种子的逐次指标
+├─ summary.csv                 多种子均值、标准差和验证排名
+├─ comparison.png              四种表示的测试正确率
+├─ selected_model.json         按验证规则选出的权重
+├─ split.csv                   本轮使用的固定拆分
+└─ config.json                 有效配置快照
+```
 
-三个Softmax概率依次表示：
+每次训练：
 
-~~~text
-P(仅MG1), P(仅R6G), P(两者都有)
-~~~
+```text
+output/<run_id>/<architecture>/<channel_set>/seed_<n>/
+├─ metrics.json
+├─ history.csv
+└─ diagnostics.png
 
-三个概率之和为1，最大概率对应最终类别。成分存在概率按下式派生：
+pt/<run_id>/<architecture>/<channel_set>/seed_<n>/best.pt
+```
 
-~~~text
-P(MG1存在) = P(仅MG1) + P(两者都有)
-P(R6G存在) = P(仅R6G) + P(两者都有)
-~~~
+三个模型的比较目录另外包含：
 
-模型概率是分类分数，不表示化学浓度或混合比例。
+```text
+├─ model_summary.csv
+├─ confusion_matrices.png          3模型 × 4表示的12个测试混淆矩阵
+├─ training_curves_msnet.png       四种表示不同颜色；多种子逐行显示
+├─ training_curves_cnn1d.png
+└─ training_curves_resnet1d.png
+```
 
-## 7. 数据拆分与预处理
+判断顺序必须是：
 
-默认拆分参数为：
+1. 用验证正确率、验证Macro-F1、验证损失和参数量完成排名；
+2. 查看跨种子均值与标准差，排除幸运种子；
+3. 再报告测试Accuracy、Macro-F1、错误数和混淆矩阵；
+4. 增强实验额外报告鲁棒性结果；
+5. 若内部测试全部接近100%，应说明性能饱和，不能据此宣称复杂模型显著更优。
 
-~~~text
-训练目标比例：0.65
-验证目标比例：0.15
-测试目标比例：0.20
-连续采集块大小：10
-随机种子：66
-~~~
+Macro-F1先分别计算三个类别的F1，再等权平均，因此能防止样本较多的“两者都有”类别掩盖其他类别的错误。
 
-程序根据扩充样本编号恢复其原始光谱来源，在每个“源文件 × 浓度”内部将连续10条原始光谱组成一个采集块，再按固定随机种子分配整块。同一原始光谱及其4份扩充版本绝不会跨集合。
+## 8. 模型来源与实现边界
 
-来源绑定只决定集合归属：同一原始光谱及其4份扩充版本绝不会跨集合。划分完成后，每一行均作为一个模型输入，独立参与对应集合的损失、准确率、F1和混淆矩阵计算，不按父光谱合并。当前实际使用数量为：
+`cnn1d` 与 `resnet1d` 参考 Wang、Yan、Oates 的[时间序列分类FCN/ResNet论文](https://arxiv.org/abs/1611.06455)以及作者团队的 [`dl-4-tsc`](https://github.com/hfawaz/dl-4-tsc) 开源实现，并在本工程中独立改写为PyTorch、统一使用三分类头和当前训练协议。Keras官方也提供了相近的[一维时间序列分类示例](https://keras.io/examples/timeseries/timeseries_classification_from_scratch/)。
 
-| 集合 | 样本数 | 用途 |
-|---|---:|---|
-| 训练集 | 6010 | 1202条父光谱×5，用于拟合预处理和训练 |
-| 验证集 | 2000 | 400条父光谱×5，选择最佳权重和执行早停 |
-| 测试集 | 1995 | 399条父光谱×5，权重固定后的最终评价 |
+MSNet为本工程主模型，其中残差连接参考[ResNet](https://arxiv.org/abs/1512.03385)，通道重标定参考[Squeeze-and-Excitation](https://arxiv.org/abs/1709.01507)；多尺度卷积分支、三种池化组合及其光谱任务适配是本工程实现。更详细的结构差异与开源出处见 [MODELS.md](MODELS.md)。
 
-因此，测试混淆矩阵全部单元格之和应为1995。这里的1995是“评价行数”，对应399条独立测量父光谱及其扩充版本，不能写成1995次独立实验测量。
+## 9. 自检、预测与发布
 
-预处理顺序为：
+软件自检不会读取真实数据，也不会运行完整训练：
 
-1. 检查波数轴和强度数值；
-2. 修复少量内部缺失点；
-3. 必要时插值到第一份文件的参考波数轴；
-4. 根据原始光谱来源分组拆分，阻止扩充版本跨集合；
-5. 每个父光谱的全部5个版本进入同一集合，集合内各行独立参与计算；
-6. 仅使用训练集拟合逐波数点均值和标准差；
-7. 按模型编号生成原始标准化、SNV和导数通道；
-8. 训练期间按固定CSV逐批读取，不再执行随机增强。
-
-## 8. 工程自检
-
-自检不读取真实实验数据，也不写入工程的`pt`和`output`目录：
-
-~~~powershell
+```powershell
 python check.py
-~~~
+```
 
-自检内容包括：
+预测未知光谱：
 
-- 源文件和Python语法；
-- 四种通道的输入维度和网络参数量；
-- CSV读取、缺失点修复和波数插值；
-- 离线五倍扩充、来源追踪和防泄漏拆分；
-- 预处理保存/恢复；
-- 三分类指标、混淆矩阵和预测表；
-- 四模型各1轮训练与结果汇总；
-- 权重重新加载和未知样品预测；
-- 数据或参数变化后禁止复用旧结果。
-- 极小损失下仍更新最低损失权重、累计微小改善、平局和非法损失；
-- 测试时恢复的权重、最佳轮次、训练记录和摘要保持一致。
+```powershell
+python predict.py --input unknown.csv --selection output\msnet_multi\selected_model.json
+```
 
-## 9. 最终模型3训练
-
-模型3为最终默认模型。正式训练命令为：
-
-~~~powershell
-python train.py
-~~~
-
-完整等价命令为：
-
-~~~powershell
-python train.py --model 3 --epochs 120 --batch-size 32 --learning-rate 0.0003 --weight-decay 0.0001 --dropout 0.15 --patience 20 --min-delta 0.0001 --grad-clip 5 --val-fraction 0.15 --test-fraction 0.20 --group-size 10 --preprocess-clip 10 --seed 66 --device auto --num-workers 0
-~~~
-
-正式训练前的单轮流程检查命令：
-
-~~~powershell
-python train.py --epochs 1
-~~~
-
-单轮检查和正式训练均写入默认目录。后执行的正式训练覆盖单轮检查生成的同名文件：
-
-~~~text
-pt/model3/best.pt
-output/model3/*
-~~~
-
-模型根据带类别权重的三分类交叉熵更新参数，使用AdamW、余弦退火和梯度裁剪。权重选择和早停分别维护两个损失值：
-
-- **最低验证损失**：只要本轮验证交叉熵严格低于历史最低值，就复制本轮权重；相同值保留最早轮次，不受`--min-delta`限制。
-- **早停参考损失**：只有本轮损失比上次有效改善的参考值下降**超过**`--min-delta`，才更新参考值并重置耐心计数；否则计数加1。连续20轮无有效改善时停止。
-
-因此，即使损失已小于`1e-4`，更低损失仍会更新权重；小幅改善还可以相对同一个早停参考值累积。训练停止后恢复所有已完成轮次中验证损失最低的权重，再评价测试集。默认早停阈值保持`1e-4`，其含义仅为是否继续等待，不能当作权重更新门槛。
-
-训练记录新增权重更新标记、早停有效改善标记、历史最低损失、早停参考值和连续无有效改善轮数；摘要、权重和四模型对比表分别记录最佳轮次与早停参考轮次。终端使用有效数字显示微小损失，训练图标记实际保留权重的轮次。
-
-新实验记录`training_policy_version=2`。旧格式6权重仍可用于预测；旧策略实验不能通过`--skip-existing`复用为新策略结果。旧权重只保存了当时保留的一轮，无法仅靠训练记录恢复第26轮等未保存参数，必须重新训练才能生成新策略的真实结果。
-
-## 10. 四模型通道递增实验
-
-完整四模型实验命令：
-
-~~~powershell
-python run_all.py
-~~~
-
-完整显式命令：
-
-~~~powershell
-python run_all.py --epochs 120 --batch-size 32 --learning-rate 0.0003 --weight-decay 0.0001 --dropout 0.15 --patience 20 --min-delta 0.0001 --grad-clip 5 --group-size 10 --val-fraction 0.15 --test-fraction 0.20 --preprocess-clip 10 --seed 66 --device auto --num-workers 0
-~~~
-
-四模型单轮流程检查：
-
-~~~powershell
-python run_all.py --epochs 1
-~~~
-
-数据、参数、任务版本和结果文件均一致时复用完整结果：
-
-~~~powershell
-python run_all.py --skip-existing
-~~~
-
-`--skip-existing`只复用已经完整结束且训练策略版本一致的实验，不执行断点续训。未使用该选项时，模型1～4及汇总结果按同名文件覆盖。
-
-四模型均使用完全相同的数据拆分和训练参数，每个模型独立随机初始化。相邻模型的比较含义为：
-
-~~~text
-模型2 - 模型1：SNV的增量贡献
-模型3 - 模型2：一阶导数的增量贡献
-模型4 - 模型3：二阶导数的增量贡献
-~~~
-
-## 11. 未知样品预测
-
-未知样品CSV格式与训练数据相同，第二列记录`unknown`或实验编号。默认加载模型3权重：
-
-~~~powershell
-python predict.py --input data/unknown.csv
-~~~
-
-显式指定权重和输出文件：
-
-~~~powershell
-python predict.py --input data/unknown.csv --checkpoint pt/model3/best.pt --output output/predict/unknown_预测.csv
-~~~
-
-CPU预测命令：
-
-~~~powershell
-python predict.py --input data/unknown.csv --device cpu
-~~~
-
-预测程序自动恢复训练时保存的参考波数轴、标准化参数、通道组合和网络权重，不重新拟合未知数据。
-
-## 12. 输出文件
-
-单次模型3训练生成：
-
-~~~text
-pt/
-└─ model3/
-   └─ best.pt
-
-output/
-└─ model3/
-   ├─ training_config.json
-   ├─ test_metrics.json
-   ├─ 结果摘要.txt
-   ├─ tables/
-   │  ├─ dataset_manifest.csv
-   │  ├─ 数据拆分清单.csv
-   │  ├─ training_history.csv
-   │  ├─ 训练记录.csv
-   │  ├─ test_predictions.csv
-   │  ├─ 测试集逐条预测.csv
-   │  ├─ test_metrics_by_concentration.csv
-   │  ├─ 按浓度测试结果.csv
-   │  ├─ test_metrics_by_role.csv
-   │  └─ 按类别测试结果.csv
-   └─ figures/
-      ├─ training_history.png
-      └─ test_confusion_matrix.png
-~~~
-
-运行四模型实验后另外覆盖生成：
-
-~~~text
-output/compare/
-├─ tables/
-│  ├─ ablation_summary.csv
-│  ├─ 四模型对比结果.csv
-│  ├─ ablation_by_concentration.csv
-│  ├─ 各浓度对比结果.csv
-│  ├─ ablation_by_role.csv
-│  └─ 各类别对比结果.csv
-└─ figures/
-   └─ ablation_summary.png
-~~~
-
-`best.pt`保存任务格式版本、训练策略版本、模型结构参数、权重、训练集预处理参数、参考波数轴、类别顺序和训练指标。`training_config.json`保存完整参数、最低损失/早停监控摘要和数据文件SHA-256指纹。
-
-## 13. 结果阅读顺序
-
-### 13.1 结果摘要
-
-~~~powershell
-Get-Content -Encoding UTF8 output\model3\结果摘要.txt
-~~~
-
-摘要包含实际完成轮数、是否触发早停、最低损失轮次及数值、早停参考轮次及数值、测试交叉熵、完全正确率、三类别平均F1、成分平均F1和MG1/R6G召回率。
-
-### 13.2 训练曲线
-
-`output/model3/figures/training_history.png`左侧显示训练和验证交叉熵，右侧显示验证集正确率、三类别平均F1和成分平均F1。验证损失持续上升而训练损失继续下降表示过拟合风险。
-
-### 13.3 混淆矩阵
-
-`output/model3/figures/test_confusion_matrix.png`为3×3矩阵，类别顺序为仅MG1、仅R6G、两者都有。主对角线表示正确分类，非对角线表示具体误判方向。默认扩充和拆分参数下，矩阵全部单元格合计为1995，即测试集逐行评价数量；它们来自399条独立测量父光谱。
-
-### 13.4 逐条预测
-
-`output/model3/tables/测试集逐条预测.csv`包含：
-
-~~~text
-仅MG1类别概率
-仅R6G类别概率
-两者都有类别概率
-MG1存在概率
-R6G存在概率
-预测含MG1
-预测含R6G
-预测类别
-真实类别
-是否正确
-~~~
-
-逐条预测用于定位错误样品、低置信度样品、原始文件和CSV行号。
-
-### 13.5 分浓度和分类别结果
-
-`按浓度测试结果.csv`用于检查10^-2～10^-6各浓度的召回和误报；`按类别测试结果.csv`用于检查仅MG1、仅R6G和混合类的表现。
-
-### 13.6 四模型对比
-
-`output/compare/tables/四模型对比结果.csv`用于比较最佳验证损失、测试交叉熵、三分类正确率、三类别平均F1和成分指标。模型版本依据验证集结果确定，测试集用于最终报告。
-
-## 14. 常用命令
-
-~~~powershell
-# 查看离线扩充参数
-python augment_dataset.py --help
-
-# 查看训练参数
-python train.py --help
-
-# 查看四模型实验参数
-python run_all.py --help
-
-# 查看预测参数
-python predict.py --help
-
-# 工程自检
-python check.py
-
-# 从2001条原始光谱生成10005行离线扩充CSV
-python augment_dataset.py
-
-# 最终默认模型3训练
-python train.py
-
-# 分别训练模型1～4
-python train.py --model 1
-python train.py --model 2
-python train.py --model 3
-python train.py --model 4
-
-# 四模型通道递增实验
-python run_all.py
-
-# 复用数据和参数完全一致的完整结果
-python run_all.py --skip-existing
-
-# 未知样品预测
-python predict.py --input data/unknown.csv
-
-# 强制使用CPU训练或预测
-python train.py --device cpu
-python predict.py --input data/unknown.csv --device cpu
-
-~~~
-
-## 15. 结果评价原则
-
-模型评价同时考虑以下指标：
-
-1. 最佳验证交叉熵：用于选择模型版本，越低越好；
-2. 三分类完全正确率：表示测试样品分类正确比例；
-3. 三类别Macro-F1：三个类别等权平均，避免混合类样本较多造成掩盖；
-4. 成分平均F1：MG1和R6G存在判断的平均F1；
-5. 召回率：衡量漏检情况；
-6. 误报率：衡量不存在成分被错误检出的情况；
-7. 分浓度指标：检查低浓度性能是否下降；
-8. 混淆矩阵：分析具体类别之间的误判方向；
-9. 训练曲线：检查收敛、波动和过拟合。
-
-离线扩充后的10005行不能表述为10005条独立实验样本；独立测量样本量仍为2001条。验证集和测试集包含其父光谱被分入对应集合的原始行与扩充行，报告中的准确率和混淆矩阵属于“扩充行级评价”，不能等同于独立盲测性能。内部连续块与来源绑定拆分用于避免扩充版本跨集合的数据泄漏，但不能代替独立配液批次、不同日期或不同仪器上的盲测。当前模型属于封闭集合三分类模型，输入范围限定为仅MG1、仅R6G或两者混合。
+上传新版本到当前GitHub仓库前，请先阅读 [GIT_GITHUB.md](GIT_GITHUB.md)。当前本地远端为 `git@github.com:ChiaKi707/classify.git`，通常只需要检查、提交并推送，不需要重新创建仓库。
